@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai
+pinecone-client
+supabase
+httpx
+pydantic
+python-dotenv
