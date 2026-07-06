@@ -1,0 +1,14 @@
+{
+  "input_rows": 10178,
+  "rows_after_cleaning": 9936,
+  "released_rows": 10131,
+  "duplicates_removed": 195,
+  "matched_rows": 9160,
+  "unmatched_rows": 1018,
+  "match_rate": 92.19,
+  "confidence_threshold": 0.82,
+  "output_files": {
+    "canonical_movies": "data/processed/canonical_movies.csv",
+    "unmatched_movies": "data/processed/unmatched_movies.csv"
+  }
+}
