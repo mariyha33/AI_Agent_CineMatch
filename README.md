@@ -78,12 +78,73 @@ Set these (locally in `.env`, and in the Vercel project settings for production)
 ```
 LLMOD_API_KEY, LLMOD_BASE_URL, LLMOD_MODEL, LLMOD_EMBEDDING_MODEL
 TMDB_API_KEY
-PINECONE_API_KEY, PINECONE_INDEX_NAME
-SUPABASE_URL, SUPABASE_KEY
+```
+
+Optional (the app runs fully without these):
+
+```
+PINECONE_API_KEY, PINECONE_INDEX_NAME   # only needed if RAG_BACKEND=pinecone
+SUPABASE_URL, SUPABASE_KEY              # run-logging is best-effort
+RAG_BACKEND                             # "local" (default) or "pinecone"
+RAG_DOCUMENTS_PATH                      # default: data/processed/rag_documents.jsonl
 ```
 
 Optional tunables: `MAX_PASSES`, `MAX_TOOL_CALLS`, `RAG_TOP_K`, `MIN_CANDIDATES`,
 `MAX_CANDIDATES`. See `.env.example`.
+
+---
+
+## RAG index
+
+`rag_search` reads from either a local JSONL file (`RAG_BACKEND=local`, the
+default — no Pinecone account needed) or a Pinecone index (`RAG_BACKEND=pinecone`).
+Both are built the same way, from `data/processed/canonical_movies.csv` only
+(never `unmatched_movies.csv` — those rows have no verified `tmdb_id`).
+
+Build the local index:
+
+```bash
+# Smoke test — no API key needed, no cost, exercises the full pipeline:
+python scripts/build_rag_index.py --limit 20 --mock-embeddings
+
+# Real embeddings for a small sample (uses LLMOD_API_KEY):
+python scripts/build_rag_index.py --limit 20
+
+# Full build (all 9,160 canonical movies):
+python scripts/build_rag_index.py
+```
+
+This writes `data/processed/rag_documents.jsonl`, one JSON object per movie:
+`tmdb_id, title, year, genres, overview, score, runtime, embedding`.
+
+Verify every document has a real `tmdb_id`:
+
+```bash
+python -c "
+import json
+with open('data/processed/rag_documents.jsonl', encoding='utf-8') as f:
+    docs = [json.loads(l) for l in f if l.strip()]
+assert all(d.get('tmdb_id') for d in docs), 'found a document with no tmdb_id'
+print(f'{len(docs)} documents, all with a valid tmdb_id.')
+"
+```
+
+Run a local RAG smoke test (no Pinecone/API key required if built with
+`--mock-embeddings`):
+
+```bash
+python -c "
+import asyncio
+from agent.tools import rag_search
+result = asyncio.run(rag_search.execute({'query_text': 'dark action thriller like John Wick', 'top_k': 5}))
+for r in result['results']:
+    print(r['tmdb_id'], r['title'], r.get('local_score'))
+"
+```
+
+To use Pinecone instead, set `RAG_BACKEND=pinecone` and `PINECONE_API_KEY` in
+`.env`, then run `python scripts/build_rag_index.py --upsert-pinecone` (vector
+ids are deterministic: `movie-{tmdb_id}`, so re-running is idempotent).
 
 ---
 

@@ -1,8 +1,12 @@
 """Async TMDB API helper (httpx).
 
-No search-by-title endpoint is exposed — every candidate already carries a
+No search-by-title endpoint is exposed - every candidate already carries a
 tmdb_id (from RAG metadata or from discover), so title/year resolution is never
 needed at runtime.
+
+TMDB_API_KEY is optional at import time (see agent/config.py) - it is only
+checked when a real API call is attempted, so importing this module never
+requires TMDB_API_KEY. Local/mock RAG commands never call this client at all.
 """
 from __future__ import annotations
 
@@ -11,6 +15,10 @@ from typing import Any, Optional
 import httpx
 
 from agent import config
+
+
+class TMDBClientNotConfigured(RuntimeError):
+    """Raised when a TMDB API call is attempted without TMDB_API_KEY set."""
 
 
 class TMDBClient:
@@ -22,6 +30,11 @@ class TMDBClient:
         return httpx.AsyncClient(base_url=self._base_url, timeout=15.0)
 
     async def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        if not self._api_key:
+            raise TMDBClientNotConfigured(
+                "TMDB_API_KEY is not set. Set it in .env to make real TMDB API "
+                "calls. Local/mock RAG commands don't need it."
+            )
         params = dict(params or {})
         params["api_key"] = self._api_key
         async with self._client() as client:
