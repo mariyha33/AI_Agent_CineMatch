@@ -16,6 +16,9 @@ Usage:
     python scripts/build_rag_index.py --limit 20            # smoke test, no cost
     python scripts/build_rag_index.py --limit 20 --mock-embeddings  # zero API calls
     python scripts/build_rag_index.py --upsert-pinecone      # also push to Pinecone
+    python scripts/build_rag_index.py --upsert-existing-jsonl  # push an already-built
+                                                                  # jsonl to Pinecone,
+                                                                  # zero LLMOD calls
 
 Safe to re-run: existing tmdb_ids already present in the output file are
 skipped by default (use --overwrite to rebuild from scratch). Never modifies
@@ -236,6 +239,81 @@ def upsert_to_pinecone(rows: List[dict], batch_size: int = 100) -> int:
     return pinecone_client.upsert(_vectors(), batch_size=batch_size)
 
 
+def load_all_documents(path: str) -> List[dict]:
+    """Read every JSON object from an existing rag_documents.jsonl-style file.
+
+    Malformed lines are skipped with a warning rather than aborting the whole
+    read, since this is meant to run against a file that may have been built
+    over several sessions.
+    """
+    docs: List[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                docs.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(f"WARNING: skipping malformed line {line_no}: {exc}", file=sys.stderr)
+    return docs
+
+
+def upsert_existing_jsonl(
+    path: str,
+    limit: Optional[int] = None,
+    batch_size: int = 100,
+) -> int:
+    """Upsert vectors already present in an existing rag_documents.jsonl to
+    Pinecone, without re-embedding anything.
+
+    - Makes zero LLMOD calls (embeddings are read as-is from the file).
+    - Never writes to rag_documents.jsonl (read-only here).
+    - Never touches Phase 1 files (canonical_movies.csv / unmatched_movies.csv
+      / canonical_build_report.json) — this function only reads the RAG jsonl
+      and calls Pinecone.
+    - Enforces the same "no tmdb_id -> no embedding -> no upsert" invariant
+      used everywhere else: any row missing tmdb_id or embedding is skipped.
+    """
+    if not os.path.exists(path):
+        print(f"ERROR: {path} not found. Build it first with scripts/build_rag_index.py.", file=sys.stderr)
+        return 0
+
+    docs = load_all_documents(path)
+    print(f"Read {len(docs)} row(s) from {path}.")
+
+    valid_rows: List[dict] = []
+    skipped = 0
+    for doc in docs:
+        if doc.get("tmdb_id") is None or not doc.get("embedding"):
+            skipped += 1
+            continue
+        valid_rows.append(doc)
+
+    if skipped:
+        print(
+            f"WARNING: skipped {skipped} row(s) missing tmdb_id and/or embedding "
+            "(not upserted).",
+            file=sys.stderr,
+        )
+
+    if limit is not None:
+        valid_rows = valid_rows[:limit]
+        print(f"  --limit applied: upserting {len(valid_rows)} row(s)")
+
+    if not valid_rows:
+        print("Nothing valid to upsert. Done.")
+        return 0
+
+    print(
+        f"Upserting {len(valid_rows)} vector(s) to Pinecone "
+        "(no LLMOD calls, rag_documents.jsonl not modified) ..."
+    )
+    n = upsert_to_pinecone(valid_rows, batch_size=batch_size)
+    print(f"Upserted {n} vector(s) to Pinecone index '{config.PINECONE_INDEX_NAME}'.")
+    return n
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Path to canonical_movies.csv")
@@ -261,9 +339,29 @@ def main() -> None:
         action="store_true",
         help="Also upsert the built vectors into Pinecone (requires PINECONE_API_KEY)",
     )
+    parser.add_argument(
+        "--upsert-existing-jsonl",
+        action="store_true",
+        help=(
+            "Upsert vectors already in rag_documents.jsonl to Pinecone without "
+            "re-embedding or calling LLMOD. Skips the canonical-CSV/embedding "
+            "pipeline entirely; does not modify rag_documents.jsonl or any "
+            "Phase 1 file. Combine with --limit to test on a small batch first."
+        ),
+    )
     args = parser.parse_args()
 
     output_path = _resolve_output_path(args.output or config.RAG_DOCUMENTS_PATH)
+
+    if args.upsert_existing_jsonl:
+        if args.upsert_pinecone:
+            print(
+                "Note: --upsert-existing-jsonl and --upsert-pinecone both set; "
+                "running --upsert-existing-jsonl only (no canonical-CSV build).",
+                file=sys.stderr,
+            )
+        upsert_existing_jsonl(output_path, limit=args.limit)
+        return
 
     print(f"Loading canonical movies from {args.input} ...")
     rows = load_canonical_rows(args.input)
