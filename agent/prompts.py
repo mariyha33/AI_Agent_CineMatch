@@ -260,10 +260,26 @@ CONSTRAINT HIERARCHY — apply this before anything else:
   to weigh, not pass/fail gates.
 - NEVER reject the only candidate(s) satisfying a HARD constraint merely for
   missing a SOFT one. If a candidate is the sole match for a named theme but
-  is more mainstream than requested, APPROVE it and use "critique" to ask the
-  retrieval agent for additional, more niche candidates that ALSO satisfy the
-  same hard constraint — don't throw the good match away while you wait for a
-  better one.
+  is more mainstream than requested, put its tmdb_id in "approved_ids" so it
+  is banked immediately and never lost — but do NOT set the overall
+  "decision" to "approve" on its account alone. Unless this is the final
+  pass or you already have {min_candidates} solid matches combined with
+  earlier passes, the overall "decision" must stay "reject", with "critique"
+  asking the retrieval agent for additional, more niche candidates that ALSO
+  satisfy the same hard constraint. "approved_ids" and "decision" are
+  independent: a candidate can be approved this pass while the pass's
+  overall decision is still "reject" — that is exactly how a good match
+  is kept without ending the search prematurely.
+- Judge "themes" semantically, not by exact wording: a candidate satisfies a
+  theme if its subject matter matches the meaning (e.g. a movie tagged
+  "interracial relationship" satisfies a "mixed-race couple" theme). Do not
+  demand the user's exact phrase — that's a false negative, not a stricter
+  match.
+- Every candidate you are given this pass MUST end up in exactly one of
+  "approved_ids" or "rejected" — never both, never neither. A candidate that
+  fails a HARD constraint goes in "rejected", full stop — it must NEVER be
+  placed in "approved_ids" as a "buffer" or filler while you wait for a
+  better match, even if you plan to ask for more candidates via "critique".
 
 For each candidate, decide if it should be kept:
 1. Does it satisfy every HARD constraint (themes/genres/similar_to/exclude)?
@@ -279,7 +295,10 @@ For each candidate, decide if it should be kept:
 
 Also consider {already_approved_count} movie(s) already approved in earlier
 passes (listed below, if any) — the final response must include ALL of them
-plus any you approve now.
+plus any you approve now, UNLESS one of them clearly violates a HARD
+constraint on reinspection (e.g. it was banked earlier as a buffer despite
+failing a theme) — in that case drop it from the final response and say why
+in "critique" or, on the final pass, note it briefly in "final_response".
 
 Return your verdict as a single JSON object (no prose, no markdown fences):
 {{
@@ -325,9 +344,13 @@ REFLECTION_FINAL_PASS = """\
 
 FINAL PASS — this verdict goes directly to the user, not back to the retrieval
 agent. "reject" is not available: approve the best valid subset (even if below
-{min_candidates}) and compose "final_response" from all approved movies. If
-NOTHING is valid, still return decision="approve" with an honest best-effort
-"final_response" that notes availability/fit could not be fully confirmed.
+{min_candidates}) and compose "final_response" from all approved movies. You
+may still drop a previously-approved movie from the final response if it
+clearly violates a HARD constraint (see the demotion rule above) — do not feel
+obligated to include a known-bad match just because it was approved earlier.
+If NOTHING is valid, still return decision="approve" with an honest
+best-effort "final_response" that notes availability/fit could not be fully
+confirmed.
 """
 
 

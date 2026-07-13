@@ -112,7 +112,7 @@ async def execute(req: ExecuteRequest) -> dict:
             "status": "error",
             "error": str(exc),
             "response": None,
-            "steps": [],
+            "steps": steps,
         }
     except Exception as exc:  # any unhandled failure -> graceful error response
         message = f"CineMatch failed to process this request: {exc}"
@@ -121,7 +121,7 @@ async def execute(req: ExecuteRequest) -> dict:
             "status": "error",
             "error": message,
             "response": None,
-            "steps": [],
+            "steps": steps,
         }
 
 

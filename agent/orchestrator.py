@@ -68,7 +68,7 @@ async def run_pipeline(
         context.pass_number = _pass
         context.is_final_pass = _pass == config.MAX_PASSES
         context.remaining_needed = max(
-            config.MAX_CANDIDATES - len(context.approved), config.MIN_CANDIDATES
+            config.MAX_CANDIDATES - len(context.approved), 1
         )
         # The RAG index has no availability signal (mediocre hit rate — see
         # Agentic loop overhaul below), so from pass 2 on tmdb_fallback_search
@@ -150,7 +150,20 @@ async def run_pipeline(
 
         _apply_verdict(verdict, available, new_candidates, context)
 
-        if verdict.decision == "approve":
+        # Defense in depth: don't let a premature "approve" (below
+        # MIN_CANDIDATES, not the final pass) end the pipeline early just
+        # because the model treated "bank this one hard-constraint match" as
+        # license to stop searching. Reflection's prompt tells it to keep
+        # "decision" at "reject" until enough candidates have accumulated,
+        # but this is a real trace-observed failure mode worth guarding in
+        # code rather than trusting the model's count-math alone.
+        premature_approve = (
+            verdict.decision == "approve"
+            and not context.is_final_pass
+            and len(context.approved) < config.MIN_CANDIDATES
+        )
+
+        if verdict.decision == "approve" and not premature_approve:
             response_text = verdict.final_response or _compose_final(context.approved, preferences)
             return response_text, _build_session_state(context, prior_state, context.approved)
 
@@ -165,7 +178,18 @@ async def run_pipeline(
         if context.is_final_pass:
             break
 
-        context.feedback = verdict.critique
+        if premature_approve:
+            # The model thought it was done, so it likely left "critique"
+            # empty — synthesize feedback rather than running the next pass
+            # with no guidance at all.
+            context.feedback = verdict.critique or (
+                f"You have only {len(context.approved)} approved movie(s) so "
+                f"far, below the required {config.MIN_CANDIDATES}. Keep "
+                "searching for more genuinely new matching movies before "
+                "this can be approved."
+            )
+        else:
+            context.feedback = verdict.critique
         context.use_fallback = verdict.use_fallback
 
     # Passes exhausted -> best effort from whatever accumulated.
@@ -263,11 +287,24 @@ async def _verify_availability(
 def _apply_verdict(
     verdict, available: List[dict], new_candidates: List[Candidate], context: ReactContext
 ) -> None:
-    """Fold this pass's per-candidate outcomes into cross-pass approved/excluded state."""
+    """Fold this pass's per-candidate outcomes into cross-pass approved/excluded state.
+
+    Every candidate the Reflection agent was given this pass must land in
+    exactly one bucket. If the model's response leaves one in neither list (or
+    puts it in both), treat it as rejected rather than letting it silently
+    vanish — otherwise ReAct could re-surface it next pass since it's absent
+    from both context.approved and context.excluded (see _drop_known_movies).
+    """
+    approved_ids = set(verdict.approved_ids)
+    rejected_ids = {r.tmdb_id for r in verdict.rejected}
+    conflicting_ids = approved_ids & rejected_ids
+    if conflicting_ids:
+        approved_ids -= conflicting_ids
+
     verified_by_id = {v["tmdb_id"]: v for v in available}
     original_by_id = {c.tmdb_id: c for c in new_candidates}
 
-    for aid in verdict.approved_ids:
+    for aid in approved_ids:
         v = verified_by_id.get(aid)
         if v is None:
             continue
@@ -287,6 +324,17 @@ def _apply_verdict(
     for r in verdict.rejected:
         context.excluded.append(
             ExcludedMovie(tmdb_id=r.tmdb_id, title=r.title, reason=r.reason)
+        )
+
+    unaccounted_ids = set(verified_by_id.keys()) - approved_ids - rejected_ids
+    for uid in unaccounted_ids:
+        v = verified_by_id[uid]
+        context.excluded.append(
+            ExcludedMovie(
+                tmdb_id=uid,
+                title=v.get("title") or "Unknown",
+                reason="Reflection did not explicitly approve or reject this candidate.",
+            )
         )
 
 

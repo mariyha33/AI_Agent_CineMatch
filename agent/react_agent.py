@@ -53,7 +53,10 @@ def _build_user_context(context: ReactContext) -> str:
         "User preferences (JSON):\n"
         + json.dumps(prefs.model_dump(), ensure_ascii=False)
         + f"\n\nFind at least {needed} NEW matching movie(s) (a couple extra as "
-        + "buffer is fine in case some don't pass review)."
+        + "buffer is fine in case some turn out to be unavailable — but every "
+        + "candidate, including buffers, must still satisfy all hard theme "
+        + "constraints; never include one you know fails a theme just to pad "
+        + "the list)."
     )
 
 

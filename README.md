@@ -510,3 +510,92 @@ The ReAct ↔ Reflection loop was slow and lost progress between passes. Changes
   *Why:* a silent no-op filter is a worse failure mode than a slightly
   redundant defensive check — the model has no way to notice its rating
   filter did nothing.
+
+---
+
+## Trace-driven hardening (2026-07-13)
+
+A real conversation trace ("cute niche rom-com on Netflix Israel with a
+mixed-race couple") surfaced a final answer where 2 of 3 recommendations
+didn't actually feature a mixed-race couple. Fixes below trace back to that
+run plus an independent audit of the same code paths.
+
+- **`tmdb_fallback_search`'s keyword resolution is now a real fuzzy lookup
+  against `/search/keyword`, and a failed hard-keyword match is never
+  silently swapped for the soft `keywords_any` filter.** Previously
+  `_resolve_keyword_ids` only tried an exact (case-insensitive) name match on
+  the whole phrase; "mixed-race couple" has no such TMDB keyword (the real
+  one is "interracial relationship"), so `keyword_ids_all` came back empty
+  and the code fell through to OR-ing the *soft* `keywords_any` terms
+  instead ("cute", "rom-com", …) — exactly how a snowman rom-com with zero
+  interracial content passed as a verified match in the trace. Resolution
+  now tries, per term: exact match → substring match either way → the same
+  two checks against each significant sub-word of the phrase (via more
+  `/search/keyword` calls). If a hard term still can't be resolved, the tool
+  result now reports it explicitly (`unresolved_keywords_all`,
+  `keyword_filter_applied`, `warning`) instead of quietly degrading to a
+  softer filter, so the retrieval agent knows to retry with a different term
+  rather than trust an unfiltered result set.
+  *Why:* a silently-unapplied hard filter is indistinguishable from a
+  correctly-applied one in the tool's output — the only fix is to make the
+  degradation visible.
+- **Reflection can no longer bank a hard-constraint failure as "approved" —
+  and every candidate must land in exactly one bucket.** In the trace,
+  Reflection's own critique said a candidate "does not match the
+  mixed-race-couple theme at all," yet the same verdict listed it in
+  `approved_ids` as a buffer while asking for better options — and approved
+  movies are never re-litigated, so it rode all the way to the final answer.
+  The Reflection prompt now states plainly that a HARD-constraint failure
+  goes in `rejected`, never `approved_ids`, even as filler; and that every
+  candidate must appear in exactly one of the two lists. As a backstop,
+  `orchestrator._apply_verdict` now treats any candidate the model leaves in
+  neither list (or puts in both) as rejected, instead of letting it vanish
+  from cross-pass state entirely.
+  *Why:* prompt instructions are a strong nudge, not a guarantee — same
+  reasoning as the existing dedup/availability backstops above.
+- **Reflection now judges themes semantically instead of by exact wording,
+  and the ReAct prompt no longer invites non-matching "buffer" candidates.**
+  The trace also showed Reflection downgrading the one correct match because
+  its TMDB keyword ("interracial relationship") wasn't the user's literal
+  phrase ("mixed-race couple") — a false negative, not a stricter read. The
+  Reflection prompt now says themes are judged by meaning, not exact
+  wording. Separately, `react_agent`'s "a couple extra as buffer is fine"
+  instruction was being read literally as license to include movies the
+  model *knew* failed the theme; it now explicitly says buffers exist only
+  for availability attrition, and must still satisfy every hard constraint.
+  On the final pass, Reflection may also now drop a previously-approved
+  movie from the response if it clearly violates a hard constraint on
+  reinspection, rather than being forced to include every past approval
+  no matter what.
+- **Any real access now counts as "available," consistently.** Previously
+  `tmdb_fallback_search` restricted discovery to `flatrate|free|ads`
+  (subscription-style) while `verify_recommendation` counted `rent`/`buy`
+  too — two different notions of "available" in the same pipeline. Per
+  product decision, if the user can access the movie there at all (rent, buy,
+  or subscription), it counts. `tmdb_fallback_search` now also queries
+  `flatrate|free|ads|rent|buy`; this corrects the "Cleaner monetization
+  filter" bullet in the entry above, which had gone the other way.
+- **Streaming platform names are now resolved case-insensitively, with
+  aliases for common alternate spellings — and an unresolvable platform now
+  fails loudly instead of silently dropping the filter.** `resolve_provider_ids`
+  was a case-sensitive exact-match lookup; the app's own example prompt
+  suggests "Disney+", which isn't a key in `PLATFORM_TO_PROVIDER_ID`
+  ("Disney Plus" is) — so following the app's own suggestion silently
+  produced an unfiltered-by-platform result still stamped `"available":
+  true`. Added `PLATFORM_NAME_ALIASES` (Disney+, Apple TV+, Prime Video, HBO
+  Max, Paramount+, Peacock, …) and a case-insensitive index, plus
+  `resolve_provider_ids_verbose` so `tmdb_fallback_search` can now return an
+  explicit `unknown_platform` error (mirroring the existing `unknown_country`
+  guard) instead of pretending it filtered.
+  *Why:* same principle as the country guard above — silently-wrong
+  "available" is worse than a clear error.
+- **API error responses no longer discard the collected trace.** `POST
+  /api/execute`'s error branches returned `"steps": []` even though `steps`
+  held everything gathered before the failure (and was already being sent to
+  Supabase). Both branches now return the real `steps` list, so a failed run
+  is debuggable from the GUI's trace viewer instead of blank.
+- **`remaining_needed` no longer over-asks once most candidates are already
+  approved.** It previously floored at `MIN_CANDIDATES` (3) even with e.g. 4
+  of 5 slots already filled, prompting an unnecessary search-and-verify round
+  for 1 missing slot. Now floors at 1; `MIN_CANDIDATES` remains only
+  Reflection's approve-threshold.
