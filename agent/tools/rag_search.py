@@ -1,8 +1,10 @@
-"""rag_search — semantic movie search over the pre-populated Pinecone index.
+"""rag_search — semantic movie search over the RAG-indexed movie catalog.
 
-Reads only from Pinecone (plus one embedding call). The RAG metadata already
-carries each movie's tmdb_id, so no TMDB lookup happens here. Availability is
-verified downstream by the Reflection stage.
+Backed by either Pinecone (RAG_BACKEND=pinecone) or a local JSONL fallback
+(RAG_BACKEND=local, the default — see agent/clients/local_rag_client.py). Both
+sources are built exclusively from data/processed/canonical_movies.csv, so
+every result already carries a valid tmdb_id — no TMDB lookup happens here.
+Availability is verified downstream by the Reflection stage.
 """
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ from typing import Any, List, Optional
 
 from agent import config
 from agent.clients.llm_client import llm_client
+from agent.clients.local_rag_client import local_rag_client
 from agent.clients.pinecone_client import pinecone_client
 
 TOOL_NAME = "rag_search"
@@ -78,20 +81,27 @@ async def execute(args: dict) -> dict:
 
     vector = await llm_client.embed(query_text)
     flt = _build_filter(genres, year_min, year_max, min_score)
-    matches = pinecone_client.query(vector=vector, filter=flt, top_k=top_k)
+
+    use_pinecone = config.RAG_BACKEND == "pinecone"
+    if use_pinecone:
+        matches = pinecone_client.query(vector=vector, filter=flt, top_k=top_k)
+    else:
+        matches = local_rag_client.search(vector=vector, filter=flt, top_k=top_k)
 
     results: List[dict] = []
     for m in matches:
         md = m.get("metadata", {}) or {}
-        results.append(
-            {
-                "title": md.get("title"),
-                "year": md.get("year"),
-                "tmdb_id": md.get("tmdb_id"),
-                "genres": md.get("genres", []),
-                "score": md.get("score"),
-                "overview": md.get("overview"),
-                "pinecone_score": m.get("score"),
-            }
-        )
+        result = {
+            "title": md.get("title"),
+            "year": md.get("year"),
+            "tmdb_id": md.get("tmdb_id"),
+            "genres": md.get("genres", []),
+            "score": md.get("score"),
+            "overview": md.get("overview"),
+        }
+        if use_pinecone:
+            result["pinecone_score"] = m.get("score")
+        else:
+            result["local_score"] = m.get("score")
+        results.append(result)
     return {"results": results, "count": len(results)}
