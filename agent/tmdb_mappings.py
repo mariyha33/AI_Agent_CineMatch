@@ -9,6 +9,23 @@ TMDB's live endpoints if needed:
 """
 from __future__ import annotations
 
+# Common alternate spellings/aliases users type for a platform whose TMDB
+# display name differs (e.g. the app's own example prompt suggests "Disney+",
+# but PLATFORM_TO_PROVIDER_ID's key is "Disney Plus") -> the canonical key in
+# PLATFORM_TO_PROVIDER_ID. Lookups in resolve_provider_ids are case-insensitive
+# and check this map before giving up.
+PLATFORM_NAME_ALIASES = {
+    "disney+": "Disney Plus",
+    "disney plus": "Disney Plus",
+    "apple tv+": "Apple TV Plus",
+    "prime video": "Amazon Prime Video",
+    "amazon prime": "Amazon Prime Video",
+    "hbo max": "HBO Max",
+    "max": "HBO Max",
+    "paramount+": "Paramount Plus",
+    "peacock": "Peacock Premium",
+}
+
 # Maps a streaming platform display name -> TMDB provider ID.
 PLATFORM_TO_PROVIDER_ID = {
     "Apple TV": 2,
@@ -687,14 +704,40 @@ GENRE_ID_TO_NAME = {
 }
 
 
+# Case-insensitive index over PLATFORM_TO_PROVIDER_ID, built once at import.
+_PLATFORM_TO_PROVIDER_ID_LOWER = {
+    name.lower(): pid for name, pid in PLATFORM_TO_PROVIDER_ID.items()
+}
+
+
 def resolve_provider_ids(platforms: list[str]) -> list[int]:
-    """Map platform display names to TMDB provider IDs, skipping unknowns."""
+    """Map platform display names to TMDB provider IDs, skipping unknowns.
+
+    Case-insensitive, and consults PLATFORM_NAME_ALIASES for common alternate
+    spellings (e.g. "Disney+") before giving up on a name.
+    """
+    ids, _unresolved = resolve_provider_ids_verbose(platforms)
+    return ids
+
+
+def resolve_provider_ids_verbose(platforms: list[str]) -> tuple[list[int], list[str]]:
+    """Like resolve_provider_ids, but also returns names that couldn't be
+    resolved to a TMDB provider ID at all — callers that need to warn (rather
+    than silently drop) the filter should use this."""
     ids: list[int] = []
+    unresolved: list[str] = []
     for name in platforms or []:
-        pid = PLATFORM_TO_PROVIDER_ID.get(name)
+        lowered = name.strip().lower()
+        pid = _PLATFORM_TO_PROVIDER_ID_LOWER.get(lowered)
+        if pid is None:
+            canonical = PLATFORM_NAME_ALIASES.get(lowered)
+            if canonical:
+                pid = PLATFORM_TO_PROVIDER_ID.get(canonical)
         if pid is not None:
             ids.append(pid)
-    return ids
+        else:
+            unresolved.append(name)
+    return ids, unresolved
 
 
 def resolve_region_code(country: str | None) -> str | None:

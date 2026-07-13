@@ -12,7 +12,7 @@ from typing import Any, List, Optional
 from agent.clients.tmdb_client import tmdb_client
 from agent.tmdb_mappings import (
     resolve_genre_names,
-    resolve_provider_ids,
+    resolve_provider_ids_verbose,
     resolve_region_code,
 )
 
@@ -47,10 +47,14 @@ SCHEMA = {
                         "Non-negotiable subject-matter/plot terms that EVERY "
                         "result must match (AND'd together), e.g. the user's "
                         "'themes' like 'mixed-race couple' or 'heist'. Each is "
-                        "resolved to a TMDB keyword; unmatched terms are "
-                        "ignored. Put the defining constraint here, not in "
-                        "keywords_any — if this returns 0 results, retry with "
-                        "fewer/broader terms rather than moving them to "
+                        "resolved to a TMDB keyword via a fuzzy lookup (exact "
+                        "match, substring match, then a retry on significant "
+                        "sub-words). If a term still can't be resolved, the "
+                        "response reports it in 'unresolved_keywords_all' and "
+                        "the filter is simply NOT applied for that term (it is "
+                        "never silently swapped for keywords_any) — check that "
+                        "field and retry with a TMDB-vocabulary synonym if it's "
+                        "non-empty. Put the defining constraint here, not in "
                         "keywords_any."
                     ),
                 },
@@ -118,29 +122,80 @@ def _year_to_date(year: Optional[int], end: bool) -> Optional[str]:
     return f"{year}-12-31" if end else f"{year}-01-01"
 
 
-async def _resolve_keyword_ids(terms: List[str]) -> List[int]:
-    if not terms:
+def _stopword_subterms(term: str) -> List[str]:
+    """Break a multi-word phrase into candidate sub-phrases to retry against
+    /search/keyword when the exact phrase has no TMDB keyword (e.g.
+    "mixed-race couple" isn't a keyword, but "interracial relationship" is —
+    trying individual significant words gives the fuzzy match below a chance
+    to find it)."""
+    words = [w for w in term.replace("-", " ").split() if w.lower() not in {"a", "an", "the", "of"}]
+    subterms: List[str] = []
+    if len(words) > 1:
+        subterms.append(" ".join(words))
+    subterms.extend(words)
+    return subterms
+
+
+async def _lookup_keyword(term: str) -> List[dict]:
+    try:
+        data = await tmdb_client.search_keyword(term)
+    except Exception:
         return []
+    return data.get("results") or []
 
-    async def _lookup(term: str) -> Optional[int]:
-        try:
-            data = await tmdb_client.search_keyword(term)
-        except Exception:
-            return None
-        results = data.get("results") or []
-        if not results:
-            return None
-        # Prefer an exact (case-insensitive) name match over TMDB's top hit —
-        # search_keyword is a free-text search, so the first result isn't
-        # necessarily the term the caller meant.
-        wanted = term.strip().lower()
-        for r in results:
-            if (r.get("name") or "").strip().lower() == wanted:
+
+async def _resolve_one_keyword(term: str) -> Optional[int]:
+    """Resolve one subject-matter term to a TMDB keyword ID.
+
+    Tries, in order: (1) exact case-insensitive name match on the phrase,
+    (2) a substring match either way between the phrase and a keyword name,
+    (3) the same two checks against each significant sub-word of the phrase.
+    Returns None if nothing plausible is found — the caller must not then
+    silently substitute a different (soft) filter.
+    """
+    wanted = term.strip().lower()
+    if not wanted:
+        return None
+
+    results = await _lookup_keyword(term)
+    for r in results:
+        if (r.get("name") or "").strip().lower() == wanted:
+            return r["id"]
+    for r in results:
+        name = (r.get("name") or "").strip().lower()
+        if name and (name in wanted or wanted in name):
+            return r["id"]
+
+    for sub in _stopword_subterms(term)[1:]:  # skip the already-tried full phrase
+        sub_results = await _lookup_keyword(sub)
+        sub_wanted = sub.strip().lower()
+        for r in sub_results:
+            name = (r.get("name") or "").strip().lower()
+            if name == sub_wanted or (name and (name in wanted or wanted in name)):
                 return r["id"]
-        return results[0]["id"]
 
-    resolved = await asyncio.gather(*(_lookup(t) for t in terms))
-    return [kid for kid in resolved if kid is not None]
+    return None
+
+
+async def _resolve_keyword_ids(terms: List[str]) -> tuple[List[int], List[str]]:
+    """Resolve each term to a TMDB keyword ID where possible.
+
+    Returns (resolved_ids, unresolved_terms) — unresolved_terms must be
+    surfaced to the caller rather than silently dropped, since dropping a
+    hard-constraint term changes what the search actually filters on.
+    """
+    if not terms:
+        return [], []
+
+    resolved = await asyncio.gather(*(_resolve_one_keyword(t) for t in terms))
+    ids: List[int] = []
+    unresolved: List[str] = []
+    for term, kid in zip(terms, resolved):
+        if kid is None:
+            unresolved.append(term)
+        else:
+            ids.append(kid)
+    return ids, unresolved
 
 
 async def execute(args: dict) -> dict:
@@ -176,26 +231,46 @@ async def execute(args: dict) -> dict:
             "count": 0,
         }
 
-    provider_ids = resolve_provider_ids(platforms)
-    keyword_ids_all, keyword_ids_any = await asyncio.gather(
+    provider_ids, unresolved_platforms = resolve_provider_ids_verbose(platforms)
+    if platforms and not provider_ids:
+        # Without a resolved provider ID, TMDB discover can't filter by
+        # platform at all — every result would come back unfiltered yet still
+        # get stamped "available": True below. Fail loudly instead (mirrors
+        # the unknown_country guard above).
+        return {
+            "error": "unknown_platform",
+            "message": (
+                f"Could not resolve platform(s) {unresolved_platforms} to a "
+                "TMDB provider ID (see agent/tmdb_mappings.py "
+                "PLATFORM_TO_PROVIDER_ID / PLATFORM_NAME_ALIASES). Results "
+                "cannot be availability-filtered for them."
+            ),
+            "results": [],
+            "count": 0,
+        }
+
+    (keyword_ids_all, unresolved_all), (keyword_ids_any, _unresolved_any) = await asyncio.gather(
         _resolve_keyword_ids(keywords_all), _resolve_keyword_ids(keywords_any)
     )
 
     filters: dict = {
         "sort_by": sort_by,
         "include_adult": "false",
-        # "rent"/"buy" are pay-per-title, not "available on <platform>" in the
-        # subscription sense the user means — only count included tiers.
-        "with_watch_monetization_types": "flatrate|free|ads",
+        # Any access the user can pay for counts as "available" — a rentable
+        # or buyable title is still watchable, so don't exclude those tiers.
+        "with_watch_monetization_types": "flatrate|free|ads|rent|buy",
     }
     if genres:
         filters["with_genres"] = ",".join(str(g) for g in genres)
     # TMDB's with_keywords doesn't support mixing AND (comma) and OR (pipe) in
     # one query, so a hard constraint (keywords_all) takes priority outright —
     # it must never be diluted by an OR against a merely-nice-to-have term.
+    # If a hard term didn't resolve at all, it's simply omitted from the
+    # filter (reported via unresolved_all below) rather than silently
+    # replaced by the soft keywords_any set.
     if keyword_ids_all:
         filters["with_keywords"] = ",".join(str(k) for k in keyword_ids_all)
-    elif keyword_ids_any:
+    elif keyword_ids_any and not unresolved_all:
         filters["with_keywords"] = "|".join(str(k) for k in keyword_ids_any)
     gte = _year_to_date(year_min, end=False)
     lte = _year_to_date(year_max, end=True)
@@ -243,4 +318,21 @@ async def execute(args: dict) -> dict:
                 "country": region,
             }
         )
-    return {"results": results, "count": len(results)}
+
+    out: dict = {"results": results, "count": len(results)}
+    if unresolved_all:
+        out["unresolved_keywords_all"] = unresolved_all
+        out["keyword_filter_applied"] = "none" if not keyword_ids_all else "all"
+        out["warning"] = (
+            f"Hard keyword(s) {unresolved_all} could not be resolved to a TMDB "
+            "keyword — results are NOT filtered by them. Verify the theme "
+            "yourself before trusting these results, or retry with a "
+            "TMDB-vocabulary synonym."
+        )
+    elif keyword_ids_all:
+        out["keyword_filter_applied"] = "all"
+    elif keyword_ids_any:
+        out["keyword_filter_applied"] = "any"
+    else:
+        out["keyword_filter_applied"] = "none"
+    return out
