@@ -48,6 +48,19 @@ architecture diagram: `TasteExtractor`, `ReActAgent`, `ReActAgent/rag_search`,
 { "prompt": "Something like Sicario on Netflix in Israel", "conversation_history": [] }
 ```
 
+**Interactive vs. non-interactive mode.** Whether the agent may ask a clarifying
+question is inferred from `conversation_history`:
+
+- **Present** (a list, even empty `[]`) → **interactive**. A GUI sends this every
+  turn, so `ask_user_clarification` is offered to the agents and the response may be
+  a follow-up question instead of recommendations.
+- **Omitted** (`null`) → **non-interactive**. Automated evaluators / raw API callers
+  cannot answer questions, so the clarification tool is withheld and the pipeline
+  **always** returns movie recommendations, making sensible assumptions for any
+  missing detail (e.g. country/platform).
+
+`session_id` is optional (used only for best-effort Supabase logging).
+
 ---
 
 ## Run locally
@@ -178,9 +191,35 @@ This repo is the **backend**. To make it fully production-ready:
    `/watch/providers/movie` and `/watch/providers/regions` endpoints.
 5. **Replace placeholder team info** in `/api/team_info`
    (`api/index.py`) with real names, emails, and your batch/order number.
-6. **Build the frontend** — a minimal page at `/` with a prompt box, a "Run
-   Agent" button calling `POST /api/execute`, and a display of `response` + the
-   full `steps` trace. Deferred to a later phase; no auth guards.
+6. **Build the frontend** — a minimal chat page at `/` calling `POST /api/execute`
+   and displaying `response` + the full `steps` trace. Deferred to a later phase;
+   no auth guards. See **GUI plan** below for the conversation/stop-condition design.
+
+---
+
+## GUI plan (frontend — not yet built)
+
+The frontend is deferred, but the backend already supports it: sending
+`conversation_history` on every turn puts the pipeline in **interactive** mode
+(see *API endpoints* above), so the agent can ask a clarifying question when it
+needs one. The planned chat UI:
+
+1. **Every turn sends `conversation_history`** — starting as `[]` on the first
+   message — so the backend always runs in interactive mode. Each user message and
+   agent reply is appended to the history the client keeps.
+2. **Clarifying questions** returned by the agent are rendered as a normal assistant
+   turn. The user's reply is appended to `conversation_history` and re-sent to
+   `/api/execute`, which reruns the pipeline with the added context.
+3. **After recommendations are shown**, render two buttons under them:
+   - **Satisfied** → display a fixed client-side template message (e.g.
+     *"Happy to help — enjoy the movie! 🎬"*) and **end the conversation** (disable
+     the input). This is purely frontend: **no `/api/execute` call and no LLM call.**
+   - **Try again** → let the user type what was wrong, append that as a `user`
+     message to `conversation_history`, and re-call `/api/execute` to rerun the
+     pipeline with the complaint as feedback.
+
+This keeps the "stop condition" entirely on the client — the satisfied path costs
+nothing, and the try-again path reuses the existing multi-turn history mechanism.
 
 ---
 

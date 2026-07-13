@@ -12,7 +12,7 @@ from typing import List
 from agent.clients.llm_client import llm_client
 from agent.models import ReActDraft, ReflectionVerdict, UserPreferences
 from agent.parsing import parse_json_object
-from agent.prompts import REFLECTION_AGENT_SYSTEM_PROMPT
+from agent.prompts import build_reflection_system_prompt
 from agent.steps import log_step
 from agent.tools import ask_user_clarification, registry
 
@@ -20,7 +20,14 @@ MODULE = "ReflectionAgent"
 
 # Reflection is a short loop: verify (maybe twice) then a verdict.
 _MAX_REFLECTION_CYCLES = 4
-_ALLOWED = ["verify_recommendation", "ask_user_clarification"]
+
+
+def _allowed_tools(interactive: bool) -> List[str]:
+    """verify_recommendation always; clarification only when interactive."""
+    tools = ["verify_recommendation"]
+    if interactive:
+        tools.append("ask_user_clarification")
+    return tools
 
 
 def _build_user_context(draft: ReActDraft, preferences: UserPreferences) -> str:
@@ -65,11 +72,14 @@ async def reflection_agent(
     draft: ReActDraft,
     preferences: UserPreferences,
     steps: List[dict],
+    interactive: bool = False,
 ) -> ReflectionVerdict:
-    tools = registry.schemas_for(_ALLOWED)
+    allowed = _allowed_tools(interactive)
+    tools = registry.schemas_for(allowed)
+    system_prompt = build_reflection_system_prompt(interactive)
     user_context = _build_user_context(draft, preferences)
     messages: List[dict] = [
-        {"role": "system", "content": REFLECTION_AGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_context},
     ]
 
@@ -80,7 +90,7 @@ async def reflection_agent(
         log_step(
             steps,
             module=MODULE,
-            system_prompt=REFLECTION_AGENT_SYSTEM_PROMPT if cycle == 0 else None,
+            system_prompt=system_prompt if cycle == 0 else None,
             user_prompt=user_context if cycle == 0 else "[continue critique]",
             response={
                 "content": message.content,
@@ -96,9 +106,9 @@ async def reflection_agent(
 
         for tool_call in message.tool_calls:
             name = tool_call.function.name
-            if not registry.exists(name) or name not in _ALLOWED:
+            if not registry.exists(name) or name not in allowed:
                 result_text = (
-                    f"Error: tool '{name}' is not available here. Available: {_ALLOWED}."
+                    f"Error: tool '{name}' is not available here. Available: {allowed}."
                 )
                 result_obj = {"error": "invalid_tool", "name": name}
             else:

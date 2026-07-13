@@ -21,10 +21,12 @@ MODULE = "ReActAgent"
 
 
 def _allowed_tools(context: ReactContext) -> List[str]:
-    """rag_search + ask_user_clarification always; fallback only when enabled."""
-    tools = ["rag_search", "ask_user_clarification"]
+    """rag_search always; fallback when enabled; clarification only interactively."""
+    tools = ["rag_search"]
     if context.use_fallback:
-        tools.insert(1, "tmdb_fallback_search")
+        tools.append("tmdb_fallback_search")
+    if context.interactive:
+        tools.append("ask_user_clarification")
     return tools
 
 
@@ -104,7 +106,9 @@ async def _run_tool(
 
 
 async def react_agent(context: ReactContext, steps: List[dict]) -> ReActDraft:
-    system_prompt = build_react_system_prompt(context.feedback, context.use_fallback)
+    system_prompt = build_react_system_prompt(
+        context.feedback, context.use_fallback, context.interactive
+    )
     allowed = _allowed_tools(context)
     tools = registry.schemas_for(allowed)
 

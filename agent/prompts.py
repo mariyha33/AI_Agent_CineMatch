@@ -75,8 +75,7 @@ your final answer as a single JSON object (no prose, no markdown fences):
   "clarification_question": null
 }}
 
-If you called `ask_user_clarification`, instead return:
-{{"candidates": [], "is_clarification": true, "clarification_question": "..."}}
+{clarification}
 """
 
 # Fragments injected into the ReAct system prompt per invocation.
@@ -91,16 +90,35 @@ REACT_USE_FALLBACK_ON = (
 REACT_USE_FALLBACK_OFF = (
     "Use `rag_search` as your primary retrieval tool this pass."
 )
+# Clarification is only offered when the caller is interactive (a GUI that can
+# relay a follow-up question). See build_react_system_prompt.
+REACT_CLARIFY_ON = (
+    "If the request is too ambiguous to proceed (e.g. missing country/platform, "
+    "or a genuine taste fork), you may call `ask_user_clarification` once. In "
+    "that case, instead return:\n"
+    '{"candidates": [], "is_clarification": true, "clarification_question": "..."}'
+)
+REACT_CLARIFY_OFF = (
+    "You CANNOT ask the user questions in this mode, and `ask_user_clarification` "
+    "is not available. If information is missing (e.g. country/platform), make "
+    "sensible assumptions and ALWAYS return at least one recommendation. Never "
+    "set is_clarification to true."
+)
 
 
-def build_react_system_prompt(feedback: str | None, use_fallback: bool) -> str:
+def build_react_system_prompt(
+    feedback: str | None, use_fallback: bool, interactive: bool
+) -> str:
     """Fill the ReAct system prompt template for one invocation."""
     feedback_line = (
         REACT_FEEDBACK_PREFIX + feedback if feedback else ""
     )
     fallback_line = REACT_USE_FALLBACK_ON if use_fallback else REACT_USE_FALLBACK_OFF
+    clarification_line = REACT_CLARIFY_ON if interactive else REACT_CLARIFY_OFF
     return REACT_AGENT_SYSTEM_PROMPT.format(
-        feedback=feedback_line, use_fallback=fallback_line
+        feedback=feedback_line,
+        use_fallback=fallback_line,
+        clarification=clarification_line,
     )
 
 
@@ -141,12 +159,28 @@ set use_fallback=true if it should search more obscurely via
 tmdb_fallback_search. Format:
 {"decision": "reject", "final_response": null,
  "critique": "<specific feedback>", "use_fallback": <bool>, "question": null}
+__CLARIFY_BLOCK__
+"""
+
+# Injected into the Reflection prompt depending on interactive mode. Clarify is
+# only offered when the caller (a GUI) can relay a follow-up question.
+REFLECTION_CLARIFY_ON = """\
 
 CLARIFY — the request is genuinely ambiguous and you cannot proceed. Use the
 `ask_user_clarification` tool OR return the question directly. Format:
 {"decision": "clarify", "final_response": null, "critique": null,
- "use_fallback": false, "question": "<the clarifying question>"}
-"""
+ "use_fallback": false, "question": "<the clarifying question>"}"""
+REFLECTION_CLARIFY_OFF = """\
+
+There is no CLARIFY option in this mode and `ask_user_clarification` is not
+available — only "approve" or "reject" are valid. If the request is ambiguous,
+make reasonable assumptions and judge on the merits rather than asking a question."""
+
+
+def build_reflection_system_prompt(interactive: bool) -> str:
+    """Fill the Reflection system prompt for one invocation."""
+    block = REFLECTION_CLARIFY_ON if interactive else REFLECTION_CLARIFY_OFF
+    return REFLECTION_AGENT_SYSTEM_PROMPT.replace("__CLARIFY_BLOCK__", block)
 
 
 # -----------------------------------------------------------------------------

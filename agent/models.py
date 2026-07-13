@@ -47,6 +47,9 @@ class ReactContext(BaseModel):
     preferences: UserPreferences
     feedback: Optional[str] = None
     use_fallback: bool = False
+    # True only when the caller is interactive (a GUI that can relay a follow-up
+    # question). Gates whether ask_user_clarification is offered to the agent.
+    interactive: bool = False
 
 
 # --- Stage 2: Reflection verdict ---------------------------------------------

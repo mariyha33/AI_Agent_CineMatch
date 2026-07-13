@@ -20,24 +20,45 @@ async def run_pipeline(
     conversation_history: Optional[List[Message]],
     steps: List[dict],
 ) -> str:
+    # Interactive (GUI) callers send conversation_history — even an empty list on
+    # turn 1 — so they can relay a follow-up question. Automated/eval callers omit
+    # it (None); for them the pipeline must ALWAYS return recommendations, never a
+    # question. This gates whether ask_user_clarification is offered downstream.
+    interactive = conversation_history is not None
+
     # --- Stage 0 — Taste Extraction -----------------------------------------
     preferences = await taste_extractor(prompt, conversation_history, steps)
 
     # --- Stage 1 + 2 — ReAct <-> Reflection loop ----------------------------
-    context = ReactContext(preferences=preferences, feedback=None, use_fallback=False)
+    context = ReactContext(
+        preferences=preferences,
+        feedback=None,
+        use_fallback=False,
+        interactive=interactive,
+    )
 
     draft: ReActDraft = ReActDraft()
     for _pass in range(1, config.MAX_PASSES + 1):
         draft = await _run_react_with_fallback(context, steps)
 
-        # ReAct asked the user a question -> short-circuit.
-        if draft.is_clarification:
+        # ReAct asked the user a question -> short-circuit (interactive only). In
+        # non-interactive mode a stray clarification is ignored: fall through so a
+        # later pass / best-effort compose returns recommendations instead.
+        if draft.is_clarification and interactive:
             return draft.clarification_question or "Could you clarify your request?"
 
-        verdict = await reflection_agent(draft, preferences, steps)
+        verdict = await reflection_agent(draft, preferences, steps, interactive)
 
         if verdict.decision == "clarify":
-            return verdict.question or "Could you clarify your request?"
+            if interactive:
+                return verdict.question or "Could you clarify your request?"
+            # Non-interactive: never ask. Treat as a reject and push for recs.
+            context.feedback = (
+                "Do not ask the user questions. Make reasonable assumptions about "
+                "any missing details and return at least one recommendation."
+            )
+            context.use_fallback = verdict.use_fallback
+            continue
         if verdict.decision == "approve":
             return verdict.final_response or _compose_best_effort(draft, preferences)
 
