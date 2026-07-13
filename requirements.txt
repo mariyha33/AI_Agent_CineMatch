@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 openai
-pinecone-client
+pinecone
 supabase
 httpx
 pydantic
