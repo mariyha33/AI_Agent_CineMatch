@@ -66,13 +66,14 @@ question is inferred from `conversation_history`:
 ## Run locally
 
 ```bash
-python -m venv .venv && source .venv/Scripts/activate   # Windows Git Bash
+python -m venv .venv ; .\.venv\Scripts\Activate.ps1   # Windows Git Bash
 pip install -r requirements.txt
 cp .env.example .env        # then fill in real keys (see below)
 uvicorn api.index:app --reload
 ```
 
-Open <http://localhost:8000/docs> for interactive Swagger, or:
+Open <http://localhost:8000/> for the chat UI (see **Frontend (UI)** below), or
+<http://localhost:8000/docs> for interactive Swagger, or call the API directly:
 
 ```bash
 curl -X POST http://localhost:8000/api/execute \
@@ -81,6 +82,46 @@ curl -X POST http://localhost:8000/api/execute \
 ```
 
 > Requires Python 3.12 (matches the Vercel runtime).
+
+---
+
+## Frontend (UI)
+
+A minimal, dependency-free chat UI lives at `public/index.html` — a single self-contained
+file (inline CSS + vanilla JS, no build step). It's served two ways:
+
+- **Locally**: `GET /` in `api/index.py` returns `public/index.html` directly, so
+  `uvicorn api.index:app --reload` + opening <http://localhost:8000/> is enough.
+- **On Vercel**: files under `public/` are served automatically as static assets at `/`,
+  alongside the `/api/*` serverless function — no extra config needed.
+
+What it does:
+
+- Sends every turn to `POST /api/execute` with `conversation_history` (starting as `[]`),
+  which keeps the pipeline in **interactive mode** so it can ask clarifying questions.
+- Renders the agent's reply as markdown, and — for each step in the response's `steps[]` —
+  a collapsible entry showing that step's `module`, `system_prompt` / `user_prompt`, and
+  `response` (click **Show execution trace** under any reply to expand it).
+- Detects a clarifying question (the last trace step's `module` ends with
+  `ask_user_clarification`) and just leaves the input open for your reply; otherwise it
+  shows **Satisfied** (ends the chat client-side, no API call) and **Try again** (lets you
+  type what was wrong and reruns the pipeline with that as feedback) — matching the
+  stop-condition design in **GUI plan** below.
+
+### Testing the UI locally
+
+1. `uvicorn api.index:app --reload` (see **Run locally** above; `.env` needs at least
+   `LLMOD_API_KEY`, `LLMOD_BASE_URL`, `LLMOD_MODEL`, `LLMOD_EMBEDDING_MODEL`, `TMDB_API_KEY`).
+2. Open <http://localhost:8000/> in a browser.
+3. Send a prompt (e.g. *"Slow-burn crime like Sicario, on Netflix in Israel"*) and confirm:
+   - A reply renders, and **Show execution trace** expands to show each step.
+   - **Satisfied** ends the conversation and disables the input, with **no** network
+     request (check the browser's Network tab).
+   - **Try again** re-calls `/api/execute` with your typed complaint appended.
+4. Send a vague prompt (e.g. *"recommend me something"*) to trigger a clarifying question;
+   confirm it renders as a normal reply, the input stays open, and your answer is appended
+   to `conversation_history` on the next request (inspect the request body in the Network
+   tab — the history array should grow each turn).
 
 ---
 
@@ -163,13 +204,37 @@ ids are deterministic: `movie-{tmdb_id}`, so re-running is idempotent).
 
 ## Deploy (Vercel)
 
-1. Push this repo to GitHub and import it into Vercel.
-2. Add all environment variables above in **Project → Settings → Environment
-   Variables**.
-3. Deploy. `vercel.json` routes `/api/*` to the Python function with a 300 s max
-   duration.
-4. Verify: `GET /api/team_info`, `GET /api/agent_info`,
-   `GET /api/model_architecture`, and a `POST /api/execute`.
+First time deploying to Vercel? Follow these steps in order.
+
+1. **Protect your secrets before pushing.** A real `.env` with live API keys exists
+   locally — make sure it's git-ignored and not committed:
+   ```bash
+   git check-ignore .env               # should print ".env" (ignored — good)
+   git ls-files --error-unmatch .env   # should ERROR "did not match" (not tracked — good)
+   ```
+   If `.env` shows as tracked instead, add it to `.gitignore`, run
+   `git rm --cached .env`, commit that, and rotate any keys that were ever pushed.
+2. **Push this repo to GitHub** (create a repo on github.com if you don't have one yet,
+   then `git push`).
+3. **Import into Vercel.** Sign in at vercel.com with "Continue with GitHub", click
+   **Add New… → Project**, select this repo, and click **Import**.
+4. **Framework preset: leave it as "Other".** This project is a Python serverless
+   function plus static files, not a Node framework — do **not** set a build command
+   or output directory; `vercel.json` already handles routing.
+5. **Add environment variables** (on the import screen, or later under
+   **Project → Settings → Environment Variables**) for **Production** (and Preview):
+   copy the required keys (`LLMOD_API_KEY`, `LLMOD_BASE_URL`, `LLMOD_MODEL`,
+   `LLMOD_EMBEDDING_MODEL`, `TMDB_API_KEY`) and any optional ones you use, from your
+   local `.env`. Never commit these values.
+6. **Deploy.** Click **Deploy** and wait for the build to finish (green "Ready").
+   `vercel.json` routes `/api/*` to the Python function (300 s max duration) and
+   serves everything in `public/` — including `public/index.html` — as static files
+   at `/`.
+7. **Redeploys are automatic**: every push to the connected branch triggers a new
+   deployment; no CLI required.
+8. **Verify**: open `https://<your-app>.vercel.app/` for the chat UI, and check
+   `GET /api/team_info`, `GET /api/agent_info`, `GET /api/model_architecture`, and a
+   `POST /api/execute`.
 
 ---
 
@@ -191,15 +256,15 @@ This repo is the **backend**. To make it fully production-ready:
    `/watch/providers/movie` and `/watch/providers/regions` endpoints.
 5. **Replace placeholder team info** in `/api/team_info`
    (`api/index.py`) with real names, emails, and your batch/order number.
-6. **Build the frontend** — a minimal chat page at `/` calling `POST /api/execute`
-   and displaying `response` + the full `steps` trace. Deferred to a later phase;
-   no auth guards. See **GUI plan** below for the conversation/stop-condition design.
+6. ~~Build the frontend~~ — done: `public/index.html` is a minimal chat page at `/`
+   calling `POST /api/execute` and displaying `response` + the full `steps` trace, no
+   auth guards. See **Frontend (UI)** and **GUI plan** below.
 
 ---
 
-## GUI plan (frontend — not yet built)
+## GUI plan (frontend design — implemented in `public/index.html`)
 
-The frontend is deferred, but the backend already supports it: sending
+The backend supports the frontend by design: sending
 `conversation_history` on every turn puts the pipeline in **interactive** mode
 (see *API endpoints* above), so the agent can ask a clarifying question when it
 needs one. The planned chat UI:
@@ -237,5 +302,6 @@ agent/clients/            llm, tmdb, pinecone, supabase clients
 agent/models.py           Pydantic data shapes
 agent/prompts.py          All system prompts + user prompt template
 agent/config.py           Env vars + tunable parameters
+public/index.html         Minimal chat UI (frontend, served at /)
 public/architecture.png   (you provide this)
 ```
