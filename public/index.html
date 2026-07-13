@@ -159,6 +159,18 @@
     max-height: 320px;
     overflow-y: auto;
   }
+  .copy-steps-btn {
+    display: block;
+    margin: 6px 2px 4px;
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .copy-steps-btn:hover { filter: brightness(1.05); }
   .actions {
     display: flex;
     gap: 8px;
@@ -266,6 +278,7 @@
 
   let conversationHistory = [];
   let conversationEnded = false;
+  let sessionState = null; // round-tripped excluded/recommended movies (see agent/models.py SessionState)
 
   function escapeHtml(str) {
     return String(str)
@@ -325,18 +338,58 @@
     scrollToBottom();
   }
 
+  // Recursively parse any JSON-looking strings (including nested ones) so
+  // responses that are themselves stringified JSON render as real objects.
+  function deepParseJson(value) {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+        try {
+          return deepParseJson(JSON.parse(trimmed));
+        } catch (e) {
+          return value;
+        }
+      }
+      return value;
+    }
+    if (Array.isArray(value)) return value.map(deepParseJson);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const k in value) out[k] = deepParseJson(value[k]);
+      return out;
+    }
+    return value;
+  }
+
   function stepFieldBlock(label, value, isPre) {
     if (value === null || value === undefined || value === "") return null;
     const wrap = el("div", { className: "step-field" });
     wrap.appendChild(el("div", { className: "label", text: label }));
     if (isPre) {
       const pre = el("pre");
-      pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      const displayValue = deepParseJson(value);
+      pre.textContent = typeof displayValue === "string" ? displayValue : JSON.stringify(displayValue, null, 2);
       wrap.appendChild(pre);
     } else {
       wrap.appendChild(el("div", { text: value }));
     }
     return wrap;
+  }
+
+  function copyStepsButton(steps) {
+    const btn = el("button", { className: "copy-steps-btn", text: "Copy steps as text" });
+    btn.addEventListener("click", async () => {
+      const text = JSON.stringify(steps, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        const original = btn.textContent;
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = original; }, 1500);
+      } catch (e) {
+        btn.textContent = "Copy failed";
+      }
+    });
+    return btn;
   }
 
   function buildTrace(steps) {
@@ -349,15 +402,15 @@
       stepEl.appendChild(el("summary", { text: step.module || "(unknown step)" }));
 
       const prompt = step.prompt || {};
-      const sys = stepFieldBlock("System prompt", prompt.system_prompt, true);
       const usr = stepFieldBlock("User prompt", prompt.user_prompt, true);
       const resp = stepFieldBlock("Response", step.response, true);
-      if (sys) stepEl.appendChild(sys);
       if (usr) stepEl.appendChild(usr);
       if (resp) stepEl.appendChild(resp);
 
       outer.appendChild(stepEl);
     });
+
+    outer.appendChild(copyStepsButton(steps));
     return outer;
   }
 
@@ -452,6 +505,7 @@
         body: JSON.stringify({
           prompt: trimmed,
           conversation_history: conversationHistory,
+          prior_state: sessionState,
         }),
       });
       data = await res.json();
@@ -476,6 +530,7 @@
 
     conversationHistory.push({ role: "user", content: trimmed });
     conversationHistory.push({ role: "assistant", content: data.response || "" });
+    sessionState = data.state || sessionState;
 
     addAssistantTurn(data.response || "", data.steps || []);
 

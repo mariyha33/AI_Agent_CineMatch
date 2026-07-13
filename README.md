@@ -45,8 +45,14 @@ architecture diagram: `TasteExtractor`, `ReActAgent`, `ReActAgent/rag_search`,
 `POST /api/execute` body:
 
 ```json
-{ "prompt": "Something like Sicario on Netflix in Israel", "conversation_history": [] }
+{ "prompt": "Something like Sicario on Netflix in Israel", "conversation_history": [], "prior_state": null }
 ```
+
+`prior_state` (optional) and the response's `state` round-trip cross-turn memory
+— movies already ruled out or already recommended — since the server itself is
+stateless between calls. Send `null`/omit on the first turn, then echo back
+whatever `state` the previous response returned on every following turn. See
+**Agentic loop overhaul** below for why this exists.
 
 **Interactive vs. non-interactive mode.** Whether the agent may ask a clarifying
 question is inferred from `conversation_history`:
@@ -144,7 +150,9 @@ RAG_DOCUMENTS_PATH                      # default: data/processed/rag_documents.
 ```
 
 Optional tunables: `MAX_PASSES`, `MAX_TOOL_CALLS`, `RAG_TOP_K`, `MIN_CANDIDATES`,
-`MAX_CANDIDATES`. See `.env.example`.
+`MAX_CANDIDATES`, `RAG_BUDGET_BY_PASS` (default `-1,1,0` — unlimited
+`rag_search` calls on pass 1, at most 1 on pass 2, none from pass 3 on). See
+`.env.example`.
 
 ---
 
@@ -305,3 +313,200 @@ agent/config.py           Env vars + tunable parameters
 public/index.html         Minimal chat UI (frontend, served at /)
 public/architecture.png   (you provide this)
 ```
+
+---
+
+## Agentic loop overhaul (2026-07-13)
+
+The ReAct ↔ Reflection loop was slow and lost progress between passes. Changes made:
+
+- **Availability check moved out of Reflection's LLM call.** `verify_recommendation`
+  used to run as a tool the Reflection LLM called mid-conversation (LLM call →
+  tool → second LLM call, per pass). The orchestrator now calls it directly as a
+  plain async function right after each ReAct draft — deterministic, already
+  parallel across candidates — and Reflection receives the pre-verified results.
+  Reflection is now a single LLM call instead of 2-3 sequential round-trips.
+  *Why:* availability is a deterministic lookup, not a judgment call; there's no
+  reason to spend an LLM turn deciding to call a tool whose answer is binary.
+- **Parallel tool execution within one ReAct turn.** When the model requests
+  multiple tool calls in the same turn (e.g. two `rag_search` calls), they now
+  run concurrently via `asyncio.gather` instead of one after another.
+  *Why:* the trace showed this happening on nearly every pass; the calls are
+  independent, so serializing them was pure wasted latency.
+- **Approved/excluded state now carries across passes.** `ReactContext` gained
+  `approved` and `excluded` lists; the Reflection verdict is now per-candidate
+  (`approved_ids` / `rejected`, not just an overall approve/reject). Approved
+  movies are saved toward the final answer and never re-searched; excluded ones
+  (failed availability or bad taste match) are listed in ReAct's next prompt so
+  it looks for genuinely different movies instead of re-surfacing the same
+  rejected titles. The loop exits as soon as enough movies are approved,
+  without waiting for a full extra pass.
+  *Why:* previously each pass started from a blank slate — a rejected batch was
+  simply discarded and ReAct had no memory of what didn't work, so it would
+  often propose the same or very similar candidates again.
+- **Both agents know when they're on the last pass.** `MAX_PASSES` went from 2
+  to 3 (now that retries are cheap and targeted, an extra round is worth it).
+  On the final pass, ReAct is told to return its strongest list immediately
+  (no clarification), and Reflection is told "reject" is not an option — it
+  must compose the best possible answer from whatever was approved, so the
+  user always gets a real response instead of a dangling rejection.
+  *Why:* previously a rejection on the last allowed pass fell through to a
+  generic "best guess" composer with no availability confirmation, even when
+  perfectly good approved movies existed from earlier passes.
+- **`tmdb_fallback_search` upgraded to actually search "niche."** Added
+  `vote_count_min`/`vote_count_max` (the main lever for avoiding blockbusters),
+  `sort_by`, `keywords` (resolved via TMDB's `/search/keyword`), `runtime_min`/
+  `runtime_max`, and `original_language`. Fixed the monetization filter to only
+  count `flatrate|free|ads` (subscription-style availability) instead of also
+  matching `rent|buy`, which was reporting pay-per-title movies as "available."
+  Genre IDs are now mapped to names (matching `rag_search`'s output shape)
+  instead of leaking raw TMDB integers.
+  *Why:* the tool defaulted to `sort_by=popularity.desc` with no way to filter
+  it out — a "niche rom-com" request was surfacing *Mamma Mia!* and *The 40-
+  Year-Old Virgin*, the opposite of what was asked.
+- **Cleaner execution trace.** ReAct no longer logs a step for a turn that is
+  just `{"content": null, "tool_calls": [...]}` — the following
+  `ReActAgent/<tool>` step already shows what happened. The prompt now asks the
+  model to include a one-sentence rationale when it does call a tool, so the
+  steps that remain are informative instead of empty placeholders.
+  *Why:* the trace was cluttered with content-free entries that added noise
+  without adding information.
+- **Cross-turn memory now survives between conversation turns.** Previously
+  `ReactContext.approved`/`excluded` only lived inside a single `run_pipeline`
+  call — a "Try again" turn started from a blank slate and would re-draft,
+  re-verify, and re-reject the exact same movies the *previous* turn already
+  ruled out or already showed the user. Added `SessionState` (`excluded` +
+  `recommended`), sent by the client as `prior_state` and returned as `state`
+  on every response; the orchestrator seeds `context.excluded` from it before
+  pass 1 and folds this turn's outcome back in on every return path. The GUI
+  (`public/index.html`) now stores and echoes it automatically. As a
+  belt-and-braces fallback for callers that don't round-trip `state`, the
+  Taste Extractor prompt also scans `conversation_history` for movies the
+  assistant already recommended and adds them to `exclude`.
+  *Why:* the trace from a real "cute niche rom-com" run showed pass 3 of a
+  single turn re-retrieving movies already excluded in pass 2 — the same
+  problem, just worse, across conversation turns, since the whole pipeline
+  state was thrown away between API calls.
+- **Retrieval shifts from RAG to TMDB fallback as passes go on, deterministically.**
+  Previously `tmdb_fallback_search` only unlocked when a Reflection verdict
+  explicitly asked for it or every candidate failed availability — so a pass 2
+  or 3 could still spend its whole budget on `rag_search`, whose index has no
+  availability signal at all (in one real trace only 1 of 4 RAG-sourced
+  candidates turned out to be available). The orchestrator now forces
+  fallback mode on from pass 2 onward regardless of the verdict, and
+  `react_agent` enforces a per-pass `rag_search` call budget
+  (`RAG_BUDGET_BY_PASS`, default unlimited → 1 → 0): pass 1 still searches RAG
+  freely, pass 2 treats `tmdb_fallback_search` as primary with at most one
+  RAG call left for a genuinely new angle, and pass 3+ disables `rag_search`
+  outright. The system prompt's retrieval-tool guidance is now generated per
+  pass to match.
+  *Why:* the RAG index is the weakest link in the pipeline (mediocre
+  taste-matching, zero availability awareness), so later passes — which exist
+  specifically to recover from availability/taste rejections — should lean on
+  the tool that's actually availability-aware instead of re-querying the same
+  weak source.
+- **Taste extraction now separates hard subject-matter requirements from soft
+  mood/tone, and constrains genre names.** Added a `themes` field to
+  `UserPreferences` (e.g. `["mixed-race couple"]`) for concrete plot/subject
+  requirements the user names, distinct from `mood`'s tone/vibe text. The
+  Taste Extractor prompt now also enumerates the exact 19 TMDB genre names
+  instead of leaving `genres` free-form (casual terms like "rom-com" or
+  "sci-fi" previously risked producing a genre string `rag_search`'s exact
+  filter would never match).
+  *Why:* setup for the Reflection fix below — a hard/soft constraint
+  hierarchy needs a structured place to put the hard constraints instead of
+  burying them in free text.
+- **Reflection can no longer trade away a defining constraint for "niche."**
+  In a real trace, Reflection rejected the *only* candidate matching the
+  user's explicit "mixed-race couple" ask — solely because it judged the
+  movie too mainstream — leaving the final answer with two recommendations
+  that didn't feature a mixed-race couple at all. Root cause: TMDB's
+  `popularity` field (passed to Reflection as the only mainstream-ness
+  signal) is a unitless, constantly-rescaled trending metric, not a measure
+  of fame, so the model's calibration of it was arbitrary. Fixed by (1)
+  surfacing `vote_count` from TMDB (a real proxy: roughly <500 = niche,
+  >5000 = mainstream) instead of `popularity`, and (2) adding an explicit
+  constraint hierarchy to both the Reflection and ReAct prompts: anything in
+  `themes`/`genres`/`similar_to`/`exclude` is a HARD constraint a candidate
+  must satisfy outright, while `mood`'s tone/vibe words are SOFT preferences
+  that must never override a HARD-constraint match. Reflection is now told
+  explicitly: never reject the only candidate satisfying a hard constraint
+  for missing a soft one — approve it and ask (via critique) for more,
+  nicher options that *also* satisfy the same hard constraint.
+  *Why:* the whole point of the mixed-race-couple ask was the hard
+  constraint; "niche" was a nice-to-have on top of it, but the agent had no
+  way to know which preference was allowed to lose.
+- **`tmdb_fallback_search`'s keyword filter no longer dilutes the defining
+  constraint with an OR.** The old single `keywords` argument was always
+  pipe-joined (`a|b|c` = TMDB's OR), so a query like `["interracial couple",
+  "romantic comedy", "sweet romance", "quirky", "small town"]` matched *any
+  one* term — which is how a movie with zero mixed-race-couple content
+  (matched only on "romantic comedy") outranked the actual match in a real
+  trace. Split the argument into `keywords_all` (AND-joined — the hard,
+  non-negotiable terms) and `keywords_any` (OR-joined flavor terms, only used
+  when `keywords_all` is empty, since TMDB's `with_keywords` can't mix AND
+  and OR in one query). Also fixed `_resolve_keyword_ids` to prefer an exact
+  (case-insensitive) name match from TMDB's keyword search instead of
+  blindly taking the first hit.
+  *Why:* for a request built around one defining constraint, OR-only
+  filtering means that constraint is just one vote among several — exactly
+  the failure mode that put a movie with no mixed-race couple at the top of
+  the results.
+- **`rag_search`/`tmdb_fallback_search` now deterministically drop
+  already-approved/excluded movies from their own results**, instead of
+  relying on the model to notice the "Already approved" / "Excluded" lists in
+  the prompt. A real trace showed pass 3 re-retrieving three movies
+  (`Playing by Heart`, `Meet Cute`, `You People`) that were already excluded
+  in pass 2 — wasted tool calls and wasted verification. `_run_tool` now
+  filters both tools' `results` against the current pass's known tmdb_ids
+  and reports how many were filtered (`filtered_out`), so the model still
+  sees why its result count shrank.
+  *Why:* prompt instructions are a strong nudge, not a guarantee — this is
+  the kind of check that's cheap and exact to do in code and shouldn't be
+  left to the model's attention.
+- **`tmdb_fallback_search` no longer silently claims availability for an
+  unmapped country.** If `resolve_region_code` can't map the given country
+  (anything outside the small `COUNTRY_TO_REGION_CODE` table), the tool used
+  to just omit `watch_region`/`with_watch_providers` from the TMDB query and
+  still stamp every result `"available": True` — an unfiltered global result
+  set presented as confirmed-available. It now returns an explicit
+  `unknown_country` error with zero results instead. Also stopped trusting
+  the model to copy `country`/`platforms` into every call — `react_agent`
+  now injects them server-side from the parsed preferences (they're removed
+  from the schema's `required` list accordingly), so a mismatched or garbled
+  copy can no longer produce wrong availability results.
+  *Why:* silently-wrong "available" is worse than an obvious error — the
+  whole point of this agent is never claiming a movie is available without a
+  real, region-aware lookup.
+- **The RAG-outage retry no longer swallows unrelated bugs.** `orchestrator._run_react_with_fallback`'s
+  bare `except Exception` was meant to catch "Pinecone is unreachable" — but
+  every tool-execution error is already caught and turned into feedback
+  *inside* `react_agent`'s own tool loop, so nothing RAG-related ever
+  actually reached this handler. In practice it was catching things like the
+  "too many invalid tool calls in a row" `RuntimeError` and any LLM
+  connection/auth error, silently flipping on fallback mode and re-running
+  the *entire* ReAct pass instead of surfacing the real bug. Added a
+  dedicated `RagUnavailable` exception, raised from `rag_search.execute` only
+  for an embedding-call or vector-backend failure and explicitly re-raised
+  (not swallowed) out of `react_agent`'s tool loop; the orchestrator now
+  catches exactly that type.
+  *Why:* a blanket `except Exception` around a whole agent pass should be
+  reserved for the one failure it's actually designed to recover from —
+  otherwise it doubles the cost of every other bug and hides what actually
+  went wrong.
+- **`TMDBClient` reuses one `httpx.AsyncClient` instead of opening a new one
+  per request.** `verify_recommendation` makes 3 TMDB calls per candidate (a
+  5-candidate draft = 15 calls); each was paying a fresh TCP+TLS handshake
+  before this fix. The client is now created lazily on first use and reused
+  for the process's lifetime.
+  *Why:* pure wasted latency with no upside — this is the single biggest
+  win available outside of the pass-count/retry reductions above.
+- **`rag_search`'s `min_score` scale is now documented and defended against
+  mix-ups.** The schema called it "minimum IMDB rating" while the indexed
+  `score` values are actually 0-100 (e.g. 58, 66 in a real trace) — a model
+  forwarding `preferences.min_rating` (0-10, e.g. 7.0) as-is would silently
+  produce a no-op filter. The schema description now states the 0-100 scale
+  explicitly, and `_build_filter` defensively multiplies any value ≤ 10 by 10.
+  *Why:* a silent no-op filter is a worse failure mode than a slightly
+  redundant defensive check — the model has no way to notice its rating
+  filter did nothing.

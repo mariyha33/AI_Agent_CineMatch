@@ -12,6 +12,11 @@ class UserPreferences(BaseModel):
 
     mood: Optional[str] = None
     genres: List[str] = Field(default_factory=list)
+    # Hard subject-matter/plot requirements pulled out of free-text mood (e.g.
+    # ["mixed-race couple"]) — unlike mood/tone, these are non-negotiable and
+    # drive tmdb_fallback_search's keywords_all (agent/tools/tmdb_fallback_search.py)
+    # and Reflection's hard/soft constraint check (agent/prompts.py).
+    themes: List[str] = Field(default_factory=list)
     similar_to: List[str] = Field(default_factory=list)
     exclude: List[str] = Field(default_factory=list)
     country: Optional[str] = None
@@ -31,6 +36,10 @@ class Candidate(BaseModel):
     genres: List[str] = Field(default_factory=list)
     overview: Optional[str] = None
     rationale: Optional[str] = None
+    # Populated once availability is verified (orchestrator), so the final
+    # composed response can name the exact matched platform rather than
+    # guessing from the user's requested platform list.
+    platform: Optional[str] = None
 
 
 class ReActDraft(BaseModel):
@@ -39,6 +48,31 @@ class ReActDraft(BaseModel):
     candidates: List[Candidate] = Field(default_factory=list)
     is_clarification: bool = False
     clarification_question: Optional[str] = None
+
+
+class ExcludedMovie(BaseModel):
+    """A candidate ruled out (unavailable or a taste mismatch) in a prior pass.
+
+    Carried across passes so ReAct doesn't re-surface it and Reflection doesn't
+    re-litigate it.
+    """
+
+    tmdb_id: int
+    title: str
+    reason: str
+
+
+class SessionState(BaseModel):
+    """Cross-turn memory the client round-trips between /api/execute calls.
+
+    The server is a stateless function (see api/index.py), so anything that
+    must survive across conversation turns (this run's excluded/recommended
+    movies) has to be handed back to the caller and re-sent on the next turn,
+    rather than kept in server-side memory.
+    """
+
+    excluded: List[ExcludedMovie] = Field(default_factory=list)
+    recommended: List[ExcludedMovie] = Field(default_factory=list)
 
 
 class ReactContext(BaseModel):
@@ -50,9 +84,24 @@ class ReactContext(BaseModel):
     # True only when the caller is interactive (a GUI that can relay a follow-up
     # question). Gates whether ask_user_clarification is offered to the agent.
     interactive: bool = False
+    # Cross-pass memory so each ReAct pass searches for NEW movies rather than
+    # re-finding ones already accepted or already ruled out.
+    approved: List[Candidate] = Field(default_factory=list)
+    excluded: List[ExcludedMovie] = Field(default_factory=list)
+    remaining_needed: int = 0
+    is_final_pass: bool = False
+    # 1-indexed; drives the pass-indexed RAG->fallback retrieval policy (see
+    # agent/react_agent.py _allowed_tools / _rag_budget_for_pass).
+    pass_number: int = 1
 
 
 # --- Stage 2: Reflection verdict ---------------------------------------------
+class RejectedCandidate(BaseModel):
+    tmdb_id: int
+    title: str
+    reason: str
+
+
 class ReflectionVerdict(BaseModel):
     """Output of the Reflection agent."""
 
@@ -61,6 +110,10 @@ class ReflectionVerdict(BaseModel):
     critique: Optional[str] = None
     use_fallback: bool = False
     question: Optional[str] = None
+    # Per-candidate outcome for this pass, so the orchestrator can accumulate
+    # approved/excluded state instead of treating the pass as all-or-nothing.
+    approved_ids: List[int] = Field(default_factory=list)
+    rejected: List[RejectedCandidate] = Field(default_factory=list)
 
 
 class VerifyResult(BaseModel):
@@ -73,6 +126,7 @@ class VerifyResult(BaseModel):
     genres: List[str] = Field(default_factory=list)
     overview: Optional[str] = None
     popularity: Optional[float] = None
+    vote_count: Optional[int] = None
     keyword_tags: List[str] = Field(default_factory=list)
     verdict: str  # "pass" | "fail"
     reason: str
@@ -99,6 +153,7 @@ class ExecuteRequest(BaseModel):
     prompt: str
     conversation_history: Optional[List[Message]] = None
     session_id: Optional[str] = None
+    prior_state: Optional[SessionState] = None
 
 
 class ExecuteResponse(BaseModel):
@@ -106,3 +161,4 @@ class ExecuteResponse(BaseModel):
     error: Optional[str] = None
     response: Optional[str] = None
     steps: List[Any] = Field(default_factory=list)
+    state: Optional[SessionState] = None

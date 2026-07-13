@@ -17,6 +17,17 @@ from agent.clients.pinecone_client import pinecone_client
 
 TOOL_NAME = "rag_search"
 
+
+class RagUnavailable(RuntimeError):
+    """Raised when the embedding call or the vector backend (Pinecone / local
+    JSONL index) itself fails — as opposed to a normal empty-results search.
+
+    Distinct from a generic Exception so the orchestrator can retry the whole
+    ReAct pass in fallback mode specifically for this failure, instead of for
+    any bug in the agent loop (see agent/orchestrator.py
+    _run_react_with_fallback).
+    """
+
 SCHEMA = {
     "type": "function",
     "function": {
@@ -24,6 +35,7 @@ SCHEMA = {
         "description": (
             "Semantic search over the CineMatch movie catalog (Pinecone). Use "
             "the mood/vibe and any 'similar to' titles as the query text. "
+            "Do not include the streaming service and country of streaming service in the query text, as availability is checked later. "
             "Returns candidate movies with their tmdb_id and metadata. Does not "
             "check availability."
         ),
@@ -41,7 +53,13 @@ SCHEMA = {
                 },
                 "year_min": {"type": "integer", "description": "Optional earliest release year."},
                 "year_max": {"type": "integer", "description": "Optional latest release year."},
-                "min_score": {"type": "number", "description": "Optional minimum IMDB rating."},
+                "min_score": {
+                    "type": "number",
+                    "description": (
+                        "Optional minimum rating, on the indexed 0-100 scale "
+                        "(e.g. 70 = an IMDB rating of 7.0) — NOT 0-10."
+                    ),
+                },
                 "top_k": {"type": "integer", "description": "Number of results to return."},
             },
             "required": ["query_text"],
@@ -67,6 +85,11 @@ def _build_filter(
     if year_clause:
         flt["year"] = year_clause
     if min_score is not None:
+        # Defensive: the index's `score` is 0-100, but a model (or a caller
+        # forwarding preferences.min_rating, which is 0-10) may pass a 0-10
+        # value — treat anything <= 10 as being on that scale.
+        if min_score <= 10:
+            min_score *= 10
         flt["score"] = {"$gte": min_score}
     return flt
 
@@ -79,14 +102,21 @@ async def execute(args: dict) -> dict:
     min_score = args.get("min_score")
     top_k = int(args.get("top_k") or config.RAG_TOP_K)
 
-    vector = await llm_client.embed(query_text)
+    try:
+        vector = await llm_client.embed(query_text)
+    except Exception as exc:
+        raise RagUnavailable(f"Embedding call failed: {exc}") from exc
+
     flt = _build_filter(genres, year_min, year_max, min_score)
 
     use_pinecone = config.RAG_BACKEND == "pinecone"
-    if use_pinecone:
-        matches = pinecone_client.query(vector=vector, filter=flt, top_k=top_k)
-    else:
-        matches = local_rag_client.search(vector=vector, filter=flt, top_k=top_k)
+    try:
+        if use_pinecone:
+            matches = pinecone_client.query(vector=vector, filter=flt, top_k=top_k)
+        else:
+            matches = local_rag_client.search(vector=vector, filter=flt, top_k=top_k)
+    except Exception as exc:
+        raise RagUnavailable(f"RAG backend unavailable: {exc}") from exc
 
     results: List[dict] = []
     for m in matches:

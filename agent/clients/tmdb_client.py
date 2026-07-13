@@ -25,9 +25,16 @@ class TMDBClient:
     def __init__(self) -> None:
         self._base_url = config.TMDB_BASE_URL
         self._api_key = config.TMDB_API_KEY
+        # Lazily created and reused across every call — a fresh AsyncClient
+        # per request meant a new TCP+TLS handshake for each of the 3 calls
+        # verify_recommendation makes per candidate (15 for a 5-candidate
+        # draft), which is pure wasted latency.
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=self._base_url, timeout=15.0)
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(base_url=self._base_url, timeout=15.0)
+        return self._client
 
     async def _get(self, path: str, params: Optional[dict] = None) -> Any:
         if not self._api_key:
@@ -37,10 +44,10 @@ class TMDBClient:
             )
         params = dict(params or {})
         params["api_key"] = self._api_key
-        async with self._client() as client:
-            resp = await client.get(path, params=params)
-            resp.raise_for_status()
-            return resp.json()
+        client = self._ensure_client()
+        resp = await client.get(path, params=params)
+        resp.raise_for_status()
+        return resp.json()
 
     async def get_movie(self, tmdb_id: int) -> dict:
         """Movie detail: genres, overview, rating, popularity, etc."""
@@ -57,6 +64,10 @@ class TMDBClient:
     async def discover_movies(self, filters: dict) -> dict:
         """Structured discovery: /discover/movie with the given query params."""
         return await self._get("/discover/movie", params=filters)
+
+    async def search_keyword(self, query: str) -> dict:
+        """Resolve a free-text term to TMDB keyword IDs: /search/keyword."""
+        return await self._get("/search/keyword", params={"query": query})
 
 
 tmdb_client = TMDBClient()

@@ -90,16 +90,18 @@ async def model_architecture():
 async def execute(req: ExecuteRequest) -> dict:
     steps: list = []
     try:
-        response_text = await run_pipeline(
+        response_text, state = await run_pipeline(
             prompt=req.prompt,
             conversation_history=req.conversation_history,
             steps=steps,
+            prior_state=req.prior_state,
         )
         result = {
             "status": "ok",
             "error": None,
             "response": response_text,
             "steps": steps,
+            "state": state.model_dump(),
         }
         _log_run(req, response_text, steps, "ok", None)
         return result
