@@ -132,6 +132,9 @@ async def _verify_one(
         "genres": genres,
         "overview": movie.get("overview"),
         "popularity": movie.get("popularity"),
+        # A far better mainstream-ness proxy than `popularity` (a unitless,
+        # constantly-rescaled TMDB metric) — see REFLECTION_AGENT_SYSTEM_PROMPT.
+        "vote_count": movie.get("vote_count"),
         "keyword_tags": keyword_tags[:15],
         "verdict": verdict,
         "reason": reason,

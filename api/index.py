@@ -33,6 +33,19 @@ app.add_middleware(
 )
 
 _ARCHITECTURE_PNG = os.path.join(_ROOT, "public", "architecture.png")
+_INDEX_HTML = os.path.join(_ROOT, "public", "index.html")
+
+
+# --- Frontend (served automatically by Vercel from public/; this route makes
+#     it work under local `uvicorn api.index:app` too) -----------------------
+@app.get("/")
+async def index():
+    if os.path.exists(_INDEX_HTML):
+        return FileResponse(_INDEX_HTML, media_type="text/html")
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "error": "Frontend not built. Add public/index.html."},
+    )
 
 
 # --- A. Team info ------------------------------------------------------------
@@ -77,16 +90,18 @@ async def model_architecture():
 async def execute(req: ExecuteRequest) -> dict:
     steps: list = []
     try:
-        response_text = await run_pipeline(
+        response_text, state = await run_pipeline(
             prompt=req.prompt,
             conversation_history=req.conversation_history,
             steps=steps,
+            prior_state=req.prior_state,
         )
         result = {
             "status": "ok",
             "error": None,
             "response": response_text,
             "steps": steps,
+            "state": state.model_dump(),
         }
         _log_run(req, response_text, steps, "ok", None)
         return result
@@ -97,7 +112,7 @@ async def execute(req: ExecuteRequest) -> dict:
             "status": "error",
             "error": str(exc),
             "response": None,
-            "steps": [],
+            "steps": steps,
         }
     except Exception as exc:  # any unhandled failure -> graceful error response
         message = f"CineMatch failed to process this request: {exc}"
@@ -106,7 +121,7 @@ async def execute(req: ExecuteRequest) -> dict:
             "status": "error",
             "error": message,
             "response": None,
-            "steps": [],
+            "steps": steps,
         }
 
 

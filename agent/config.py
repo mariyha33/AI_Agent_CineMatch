@@ -80,11 +80,21 @@ RAG_DOCUMENTS_PATH = _optional(
 
 
 # --- Tunable pipeline parameters ---------------------------------------------
-MAX_PASSES = int(_optional("MAX_PASSES", "2"))          # ReAct <-> Reflection loop
+MAX_PASSES = int(_optional("MAX_PASSES", "3"))          # ReAct <-> Reflection loop
 MAX_TOOL_CALLS = int(_optional("MAX_TOOL_CALLS", "8"))  # per ReAct run
 RAG_TOP_K = int(_optional("RAG_TOP_K", "10"))           # Pinecone results
 MIN_CANDIDATES = int(_optional("MIN_CANDIDATES", "3"))  # min before Reflection
 MAX_CANDIDATES = int(_optional("MAX_CANDIDATES", "5"))  # cap on final recs
+
+# Max rag_search calls allowed per ReAct pass, comma-separated by pass number
+# (1-indexed); the last value repeats for any pass beyond the list's length.
+# Default: unlimited on pass 1 (RAG is the primary tool), 1 "new angle" call
+# on pass 2, none from pass 3 on — the RAG index has no availability signal,
+# so later passes should lean on tmdb_fallback_search instead. -1 means
+# unlimited.
+RAG_BUDGET_BY_PASS = [
+    int(n) for n in _optional("RAG_BUDGET_BY_PASS", "-1,1,0").split(",")
+]
 
 # Cap on consecutive invalid tool calls before aborting a ReAct run (§12).
 MAX_CONSECUTIVE_INVALID_TOOL_CALLS = int(
