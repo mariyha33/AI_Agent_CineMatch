@@ -61,6 +61,11 @@ class TMDBClient:
         """Keyword tags for a movie: /movie/{id}/keywords."""
         return await self._get(f"/movie/{tmdb_id}/keywords")
 
+    async def get_movie_credits(self, tmdb_id: int) -> dict:
+        """Cast/crew for a movie: /movie/{id}/credits — used to enforce
+        exclude_people (director/top-billed cast)."""
+        return await self._get(f"/movie/{tmdb_id}/credits")
+
     async def discover_movies(self, filters: dict) -> dict:
         """Structured discovery: /discover/movie with the given query params."""
         return await self._get("/discover/movie", params=filters)

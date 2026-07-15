@@ -136,9 +136,34 @@ async def _run_tool(
 
     if name in ("rag_search", "tmdb_fallback_search"):
         result = _drop_known_movies(result, context)
+        result = _drop_named_movies(result, context)
 
     is_clarify = name == ask_user_clarification.TOOL_NAME and result.get("action") == "clarify"
     return json.dumps(result, ensure_ascii=False), result, is_clarify
+
+
+def _drop_named_movies(result: dict, context: ReactContext) -> dict:
+    """Filter out results whose title matches something the user already named
+    — a 'similar_to' reference or an 'exclude' entry. The user has necessarily
+    already seen a title they cited as a taste reference, so it must never
+    come back as a recommendation (e.g. rag_search's top hit for "similar to
+    Prisoners" is often literally Prisoners). This is a deterministic
+    title-match backstop; it doesn't replace the same instruction in the
+    system prompt, since a fuzzy/renamed title can still slip through."""
+    named = {
+        t.strip().lower()
+        for t in (context.preferences.similar_to + context.preferences.exclude)
+        if t and t.strip()
+    }
+    if not named:
+        return result
+    results = result.get("results") or []
+    kept = [r for r in results if (r.get("title") or "").strip().lower() not in named]
+    filtered_out = len(results) - len(kept)
+    out = dict(result, results=kept, count=len(kept))
+    if filtered_out:
+        out["filtered_out"] = out.get("filtered_out", 0) + filtered_out
+    return out
 
 
 def _drop_known_movies(result: dict, context: ReactContext) -> dict:

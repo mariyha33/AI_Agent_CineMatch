@@ -58,6 +58,11 @@ SCHEMA = {
                     "type": "string",
                     "description": "The original mood/taste description, for comparison.",
                 },
+                "exclude_people": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Directors/actors to check the credits for and fail the candidate if present.",
+                },
             },
             "required": ["candidates", "country", "platforms"],
         },
@@ -91,20 +96,50 @@ def _match_platform(
     return None
 
 
+def _excluded_person_in_credits(
+    credits: dict, excluded_lower: set, cast_limit: int = 5
+) -> Optional[str]:
+    """Return the name of an excluded director/top-billed cast member found in
+    the credits, or None. Only checks the director and the first `cast_limit`
+    billed cast members — a person appearing deep in the credits isn't what a
+    user means by "starring"."""
+    for c in credits.get("crew") or []:
+        if (c.get("job") or "").strip().lower() == "director":
+            name = (c.get("name") or "").strip()
+            if name.lower() in excluded_lower:
+                return name
+    cast = sorted(credits.get("cast") or [], key=lambda c: c.get("order", 999))
+    for c in cast[:cast_limit]:
+        name = (c.get("name") or "").strip()
+        if name.lower() in excluded_lower:
+            return name
+    return None
+
+
 async def _verify_one(
     candidate: dict,
     region: Optional[str],
     platforms: List[str],
     provider_ids: List[int],
+    excluded_people_lower: set,
 ) -> Optional[dict]:
     tmdb_id = candidate.get("tmdb_id")
     title = candidate.get("title")
     try:
-        movie, providers, keywords = await asyncio.gather(
-            tmdb_client.get_movie(tmdb_id),
-            tmdb_client.get_watch_providers(tmdb_id),
-            tmdb_client.get_movie_keywords(tmdb_id),
-        )
+        if excluded_people_lower:
+            movie, providers, keywords, credits = await asyncio.gather(
+                tmdb_client.get_movie(tmdb_id),
+                tmdb_client.get_watch_providers(tmdb_id),
+                tmdb_client.get_movie_keywords(tmdb_id),
+                tmdb_client.get_movie_credits(tmdb_id),
+            )
+        else:
+            movie, providers, keywords = await asyncio.gather(
+                tmdb_client.get_movie(tmdb_id),
+                tmdb_client.get_watch_providers(tmdb_id),
+                tmdb_client.get_movie_keywords(tmdb_id),
+            )
+            credits = None
     except Exception:
         # Skip this candidate on any TMDB error (§12).
         return None
@@ -116,7 +151,17 @@ async def _verify_one(
     genres = [g.get("name") for g in movie.get("genres", []) if g.get("name")]
     keyword_tags = [k.get("name") for k in (keywords.get("keywords") or []) if k.get("name")]
 
-    if available:
+    excluded_person = (
+        _excluded_person_in_credits(credits, excluded_people_lower)
+        if credits is not None
+        else None
+    )
+
+    if excluded_person:
+        available = False
+        matched_platform = None
+        verdict, reason = "fail", f"Involves excluded person: {excluded_person}."
+    elif available:
         verdict, reason = "pass", f"Available on {matched_platform} in {region}."
     else:
         verdict, reason = "fail", (
@@ -135,6 +180,7 @@ async def _verify_one(
         # A far better mainstream-ness proxy than `popularity` (a unitless,
         # constantly-rescaled TMDB metric) — see REFLECTION_AGENT_SYSTEM_PROMPT.
         "vote_count": movie.get("vote_count"),
+        "vote_average": movie.get("vote_average"),
         "keyword_tags": keyword_tags[:15],
         "verdict": verdict,
         "reason": reason,
@@ -145,11 +191,34 @@ async def execute(args: dict) -> dict:
     candidates: List[dict] = args.get("candidates") or []
     country = args.get("country")
     platforms: List[str] = args.get("platforms") or []
+    exclude_people: List[str] = args.get("exclude_people") or []
+    excluded_people_lower = {p.strip().lower() for p in exclude_people if p and p.strip()}
 
     region = resolve_region_code(country)
     provider_ids = resolve_provider_ids(platforms)
 
-    tasks = [_verify_one(c, region, platforms, provider_ids) for c in candidates]
+    if platforms and not region:
+        # Without a resolved region, availability can't be checked at all —
+        # every candidate would otherwise come back "fail" with a misleading
+        # per-movie reason ("not available in the requested country") when
+        # the real problem is that no usable country was ever given. Fail
+        # loudly at the batch level instead of individually and silently
+        # (mirrors tmdb_fallback_search.py's equivalent guard).
+        return {
+            "error": "missing_country" if not country else "unknown_country",
+            "message": (
+                f"Cannot verify availability on {platforms} without a "
+                f"resolvable country (got country={country!r})."
+            ),
+            "results": [],
+            "count": 0,
+            "region": region,
+        }
+
+    tasks = [
+        _verify_one(c, region, platforms, provider_ids, excluded_people_lower)
+        for c in candidates
+    ]
     settled = await asyncio.gather(*tasks)
 
     results = [r for r in settled if r is not None]

@@ -7,6 +7,7 @@ availability check is needed for its results.
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 from typing import Any, List, Optional
 
 from agent.clients.tmdb_client import tmdb_client
@@ -45,17 +46,23 @@ SCHEMA = {
                     "items": {"type": "string"},
                     "description": (
                         "Non-negotiable subject-matter/plot terms that EVERY "
-                        "result must match (AND'd together), e.g. the user's "
-                        "'themes' like 'mixed-race couple' or 'heist'. Each is "
-                        "resolved to a TMDB keyword via a fuzzy lookup (exact "
-                        "match, substring match, then a retry on significant "
-                        "sub-words). If a term still can't be resolved, the "
-                        "response reports it in 'unresolved_keywords_all' and "
-                        "the filter is simply NOT applied for that term (it is "
-                        "never silently swapped for keywords_any) — check that "
-                        "field and retry with a TMDB-vocabulary synonym if it's "
-                        "non-empty. Put the defining constraint here, not in "
-                        "keywords_any."
+                        "result must match (AND'd together — a result needs ALL "
+                        "of them, not any one), e.g. the user's 'themes' like "
+                        "'mixed-race couple' or 'heist'. NEVER put alternative/"
+                        "either-or options here (e.g. 'Japan', 'China', 'South "
+                        "Korea' for a generic 'East Asia' setting) — AND'ing "
+                        "mutually-exclusive terms returns zero results almost "
+                        "every time; use keywords_any for alternatives, or "
+                        "original_language for a regional-setting constraint. "
+                        "Each term is resolved to a TMDB keyword via a fuzzy "
+                        "lookup (exact match, substring match, then a retry on "
+                        "significant sub-words). If a term still can't be "
+                        "resolved, the response reports it in "
+                        "'unresolved_keywords_all' and the filter is simply NOT "
+                        "applied for that term (it is never silently swapped "
+                        "for keywords_any) — check that field and retry with a "
+                        "TMDB-vocabulary synonym if it's non-empty. Put the "
+                        "defining constraint here, not in keywords_any."
                     ),
                 },
                 "keywords_any": {
@@ -89,7 +96,13 @@ SCHEMA = {
                     "type": "string",
                     "description": (
                         "TMDB sort order, e.g. 'popularity.desc' (default), "
-                        "'vote_average.desc', 'primary_release_date.desc'."
+                        "'vote_average.desc', 'primary_release_date.desc'. If "
+                        "you use 'vote_average.desc' and don't set "
+                        "vote_count_min yourself, a floor of 200 is applied "
+                        "automatically so a handful of 10/10 votes can't "
+                        "outrank genuinely well-regarded films — set your own "
+                        "vote_count_min explicitly if you want a different "
+                        "floor."
                     ),
                 },
                 "country": {
@@ -211,6 +224,11 @@ async def execute(args: dict) -> dict:
     runtime_max = args.get("runtime_max")
     original_language = args.get("original_language")
     sort_by = args.get("sort_by") or "popularity.desc"
+    # A tiny handful of 10/10 votes can otherwise top a vote_average.desc sort
+    # ahead of genuinely well-regarded films — apply a sane floor unless the
+    # caller set their own.
+    if sort_by == "vote_average.desc" and vote_count_min is None:
+        vote_count_min = 200
     country = args.get("country")
     platforms: List[str] = args.get("platforms") or []
     max_results = int(args.get("max_results") or 10)
@@ -226,6 +244,24 @@ async def execute(args: dict) -> dict:
                 f"Could not resolve country '{country}' to a TMDB region code "
                 "(see agent/tmdb_mappings.py COUNTRY_TO_REGION_CODE). Results "
                 "cannot be availability-filtered for it."
+            ),
+            "results": [],
+            "count": 0,
+        }
+    if platforms and not region:
+        # No country was given at all, yet a platform filter was requested.
+        # Same underlying problem as unknown_country: without a resolved
+        # region, `with_watch_providers` is silently ignored by TMDB and every
+        # result would come back unfiltered yet still get stamped
+        # "available": True below — that's a lie. Fail loudly instead of
+        # returning misleadingly-labeled results.
+        return {
+            "error": "missing_country",
+            "message": (
+                f"No country was provided, so availability on {platforms} "
+                "cannot be verified. Get the user's country before searching "
+                "with a platform filter, or omit `platforms` to search "
+                "without availability filtering."
             ),
             "results": [],
             "count": 0,
@@ -278,6 +314,13 @@ async def execute(args: dict) -> dict:
         filters["primary_release_date.gte"] = gte
     if lte:
         filters["primary_release_date.lte"] = lte
+    else:
+        # No explicit year_max was given, so default the ceiling to today —
+        # a general discovery/"best of" search should never surface an
+        # unreleased film (its rating/votes are provisional and meaningless).
+        # If the caller explicitly wants a future year_max, that's honored
+        # above and this default never applies.
+        filters["primary_release_date.lte"] = date.today().isoformat()
     if min_rating is not None:
         filters["vote_average.gte"] = min_rating
     if vote_count_min is not None:

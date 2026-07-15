@@ -19,11 +19,25 @@ class UserPreferences(BaseModel):
     themes: List[str] = Field(default_factory=list)
     similar_to: List[str] = Field(default_factory=list)
     exclude: List[str] = Field(default_factory=list)
+    # People (directors/actors) the user wants excluded, e.g. "no Christopher
+    # Nolan films", "nothing starring Matthew McConaughey" — kept separate
+    # from `exclude` (movie titles) because checking these requires a credits
+    # lookup, not a title match (see verify_recommendation.py).
+    exclude_people: List[str] = Field(default_factory=list)
     country: Optional[str] = None
     platforms: List[str] = Field(default_factory=list)
     year_min: Optional[int] = None
     year_max: Optional[int] = None
     min_rating: Optional[float] = None
+    # Explicit vote-count bounds (e.g. "fewer than 5,000 votes") — kept as
+    # structured, searchable filters rather than a free-text theme so they can
+    # be fed straight into tmdb_fallback_search's vote_count_min/max.
+    vote_count_min: Optional[int] = None
+    vote_count_max: Optional[int] = None
+    # Set when the request is for something CineMatch can't serve (e.g. TV
+    # episodes/seasons) — a short reason the orchestrator can disclose to the
+    # user instead of silently substituting movies for the actual ask.
+    out_of_scope: Optional[str] = None
 
 
 # --- Stage 1: ReAct draft ----------------------------------------------------
@@ -127,6 +141,7 @@ class VerifyResult(BaseModel):
     overview: Optional[str] = None
     popularity: Optional[float] = None
     vote_count: Optional[int] = None
+    vote_average: Optional[float] = None
     keyword_tags: List[str] = Field(default_factory=list)
     verdict: str  # "pass" | "fail"
     reason: str

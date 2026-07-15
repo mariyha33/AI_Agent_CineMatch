@@ -24,14 +24,38 @@ Extract exactly these fields:
   Romance, Science Fiction, TV Movie, Thriller, War, Western
 - "themes": list of concrete, non-negotiable subject-matter/plot requirements
   the user names (e.g. ["mixed-race couple"], ["heist"], ["time travel"]) —
-  these are hard constraints, unlike the tone/vibe captured in "mood"
-- "similar_to": list of movie titles the user wants something like
+  these are hard constraints, unlike the tone/vibe captured in "mood". Do NOT
+  put a movie or TV show title here (that's "similar_to"), and do NOT put a
+  numeric vote-count constraint here (that's "vote_count_min"/"vote_count_max")
+- "similar_to": list of movie (or show) titles the user wants something like —
+  these are references the user has necessarily already seen, so they must
+  never be recommended back
 - "exclude": list of movie titles the user has already seen or wants excluded
+  (people go in "exclude_people" instead — see below)
+- "exclude_people": list of directors/actors the user wants avoided (e.g. "no
+  Christopher Nolan films" -> ["Christopher Nolan"], "nothing starring
+  Matthew McConaughey" -> ["Matthew McConaughey"]) — never put a person's name
+  in "exclude", which is for movie titles only
 - "country": the country used for availability checking (string or null)
 - "platforms": list of streaming platform names (e.g. ["Netflix"])
 - "year_min": integer or null
 - "year_max": integer or null
-- "min_rating": float or null
+- "min_rating": float or null. The user's number is almost always an IMDb
+  rating (0-10 scale); this pipeline only has TMDB ratings to check against,
+  which approximate but do not equal IMDb, so treat this as an approximate
+  floor, not an exact IMDb lookup
+- "vote_count_min": integer or null — from a phrase like "at least 10,000
+  votes" or "well-known"
+- "vote_count_max": integer or null — from a phrase like "fewer than 5,000
+  votes", "under 1000 ratings", or "obscure/indie" implying a low vote count
+- "out_of_scope": string or null. CineMatch only recommends MOVIES. If the
+  request is fundamentally for something else — TV show episodes/seasons,
+  music, books, games — set this to a short, honest reason (e.g. "CineMatch
+  recommends movies, not individual TV episodes."); leave every other field
+  populated as best-effort anyway (e.g. still extract genres/mood so a
+  movie-flavored fallback is possible). A movie/show NAMED as a taste
+  reference (e.g. "something like Breaking Bad") is NOT out of scope — that
+  goes in "similar_to" as normal.
 
 If conversation_history is provided, fold in previously stated preferences that
 are not overridden by the current message. Also scan any assistant turns in
@@ -69,7 +93,20 @@ Rules:
 - Availability is verified downstream, so you do NOT need to confirm it
   yourself, UNLESS you are using `tmdb_fallback_search`, whose results are
   already availability-filtered.
-- Exclude any movie the user listed in their 'exclude' list.
+- Exclude any movie the user listed in their 'exclude' list, and never
+  recommend a title the user listed in 'similar_to' — those are references
+  the user has already seen, not candidates.
+- If 'exclude_people' is non-empty, steer searches away from those
+  directors/actors where you can tell from the overview/title, but don't
+  worry about catching every case yourself — full cast/crew checking happens
+  downstream in availability verification.
+- If the user gave 'vote_count_min'/'vote_count_max', these are TMDB vote
+  counts (the user's number was probably from IMDb, but this pipeline can
+  only check TMDB data) — feed them into `tmdb_fallback_search`'s
+  `vote_count_min`/`vote_count_max` params directly. Likewise treat
+  'min_rating' as a TMDB rating floor, an approximation of the user's IMDb
+  number, not an exact match — say "TMDB rating/votes" in rationales, never
+  claim an IMDb number you were not given.
 - Note: movie runtime/duration is NOT available from `rag_search`. If the user
   asked for a duration constraint, it can only be honored via
   `tmdb_fallback_search`.
@@ -113,15 +150,6 @@ your final answer as a single JSON object (no prose, no markdown fences):
 REACT_FEEDBACK_PREFIX = (
     "Feedback from a previous Reflection pass (address it specifically): "
 )
-REACT_USE_FALLBACK_ON = (
-    "You are allowed and encouraged to use `tmdb_fallback_search` in addition to "
-    "`rag_search` this pass, e.g. to find more obscure titles or honor structured "
-    "filters like duration/availability. For a niche/not-popular request, set "
-    "vote_count_max (and optionally sort_by='vote_average.desc') to steer away "
-    "from blockbusters; put the request's defining subject-matter constraint "
-    "(the user's 'themes') in `keywords_all` — never `keywords_any` — and any "
-    "extra flavor terms in `keywords_any`."
-)
 REACT_USE_FALLBACK_OFF = (
     "Use `rag_search` as your primary retrieval tool this pass."
 )
@@ -129,6 +157,24 @@ REACT_USE_FALLBACK_OFF = (
 # (it's built purely from taste/genre metadata), so later passes lean
 # increasingly on tmdb_fallback_search, whose results are already
 # availability-filtered by TMDB itself.
+REACT_KEYWORDS_ALL_WARNING = (
+    "`keywords_all` is AND logic: every result must match EVERY term you put "
+    "there — never put alternative/either-or options (e.g. \"Japan\", "
+    "\"China\", \"South Korea\" for a generic 'East Asia' setting) in "
+    "`keywords_all`, that returns zero results almost every time. "
+    "Alternatives belong in `keywords_any`, or better, use `original_language` "
+    "(e.g. 'ja', 'ko', 'zh') for a regional-setting constraint instead of "
+    "keywords at all."
+)
+REACT_USE_FALLBACK_ON = (
+    "You are allowed and encouraged to use `tmdb_fallback_search` in addition to "
+    "`rag_search` this pass, e.g. to find more obscure titles or honor structured "
+    "filters like duration/availability. For a niche/not-popular request, set "
+    "vote_count_max (and optionally sort_by='vote_average.desc') to steer away "
+    "from blockbusters; put the request's defining subject-matter constraint "
+    "(the user's 'themes') in `keywords_all` — never `keywords_any` — and any "
+    "extra flavor terms in `keywords_any`. " + REACT_KEYWORDS_ALL_WARNING
+)
 REACT_RETRIEVAL_PASS_LIMITED = (
     "`tmdb_fallback_search` is now your PRIMARY tool this pass — its results "
     "are already availability-verified, unlike rag_search. You may make at "
@@ -138,7 +184,7 @@ REACT_RETRIEVAL_PASS_LIMITED = (
     "sort_by='vote_average.desc') to steer away from blockbusters; put the "
     "request's defining subject-matter constraint (the user's 'themes') in "
     "`keywords_all` — never `keywords_any` — and any extra flavor terms in "
-    "`keywords_any`."
+    "`keywords_any`. " + REACT_KEYWORDS_ALL_WARNING
 )
 REACT_RETRIEVAL_RAG_DISABLED = (
     "`rag_search` is disabled this pass (its budget is exhausted) — use "
@@ -146,7 +192,8 @@ REACT_RETRIEVAL_RAG_DISABLED = (
     "vote_count_max (and optionally sort_by='vote_average.desc') to steer "
     "away from blockbusters; put the request's defining subject-matter "
     "constraint (the user's 'themes') in `keywords_all` — never "
-    "`keywords_any` — and any extra flavor terms in `keywords_any`."
+    "`keywords_any` — and any extra flavor terms in `keywords_any`. "
+    + REACT_KEYWORDS_ALL_WARNING
 )
 # Clarification is only offered when the caller is interactive (a GUI that can
 # relay a follow-up question). See build_react_system_prompt.
@@ -252,9 +299,10 @@ matches the user's taste, NOT to search for new movies or check availability
 CONSTRAINT HIERARCHY — apply this before anything else:
 - HARD constraints: anything in "themes" (concrete subject-matter/plot
   requirements, e.g. "mixed-race couple", "heist"), plus "genres",
-  "similar_to", "exclude", and any year/rating filters. A candidate that
-  fails a HARD constraint must be rejected regardless of how well it fits
-  otherwise.
+  "similar_to", "exclude", "exclude_people" (director/cast to avoid — trust
+  the candidate's data; you cannot verify credits yourself here), and any
+  year/rating/vote_count filters. A candidate that fails a HARD constraint
+  must be rejected regardless of how well it fits otherwise.
 - SOFT constraints: everything in "mood" that describes tone/vibe/energy
   (e.g. "cute", "niche", "not popular", "slow-burn") — these are preferences
   to weigh, not pass/fail gates.
@@ -282,16 +330,28 @@ CONSTRAINT HIERARCHY — apply this before anything else:
   better match, even if you plan to ask for more candidates via "critique".
 
 For each candidate, decide if it should be kept:
-1. Does it satisfy every HARD constraint (themes/genres/similar_to/exclude)?
+1. Does it satisfy every HARD constraint (themes/genres/similar_to/exclude/
+   exclude_people)?
 2. Does it match the SOFT mood/tone preference — but see the rule above,
    this never overrides a HARD-constraint match.
 3. Is it something from the user's exclude/seen list that slipped through?
-4. Is there enough novelty — or are these all top-100 popular movies when the
-   user asked for something niche/lesser-known? Judge "popular" by
-   `vote_count` (roughly: <500 = niche, >5000 = mainstream), NOT by TMDB's
-   `popularity` field — that field is a unitless, constantly-rescaled
-   trending metric, not a measure of how well-known a movie is, and must not
-   be used to judge niche-ness.
+4. If the user gave "min_rating", does the candidate's `vote_average` meet
+   it? `vote_average` is TMDB's own rating — an approximation of whatever
+   IMDb number the user likely had in mind, not the same figure — so say
+   "TMDB rating" in your reasoning and never assert a specific IMDb rating or
+   vote count you were not given. If the user gave "vote_count_min" and/or
+   "vote_count_max", does `vote_count` fall inside that exact range? Use the
+   USER'S stated number(s) as the bar here, not the generic heuristic below.
+5. Is there enough novelty — or are these all top-100 popular movies when the
+   user asked for something niche/lesser-known, and the user gave no
+   explicit vote_count_max? Judge "popular" by `vote_count` (roughly: <500 =
+   niche, >5000 = mainstream), NOT by TMDB's `popularity` field — that field
+   is a unitless, constantly-rescaled trending metric, not a measure of how
+   well-known a movie is, and must not be used to judge niche-ness. A
+   franchise sequel, a big-studio tentpole, or a clip/recap/compilation cut
+   of a mainstream property does NOT count as "indie" just because its own
+   `vote_count` happens to be low — judge production scale and status, not
+   the number alone.
 
 Also consider {already_approved_count} movie(s) already approved in earlier
 passes (listed below, if any) — the final response must include ALL of them

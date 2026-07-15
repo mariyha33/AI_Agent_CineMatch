@@ -45,9 +45,72 @@ async def run_pipeline(
 
     # --- Stage 0 — Taste Extraction -----------------------------------------
     preferences = await taste_extractor(prompt, conversation_history, steps)
-
-    # --- Stage 1 + 2 — ReAct <-> Reflection loop ----------------------------
     prior_state = prior_state or SessionState()
+
+    # A request for something CineMatch fundamentally can't serve (TV
+    # episodes, etc.) must be disclosed, not silently answered with movies as
+    # if that's what was asked. Interactively, ask before burning any passes;
+    # non-interactively (must always return something), disclose up front and
+    # proceed with the movie pipeline anyway.
+    if preferences.out_of_scope and interactive:
+        return (
+            f"{preferences.out_of_scope} I can look for movies with a similar "
+            "feel instead — want me to try that?",
+            SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
+        )
+    disclosure_prefix = (
+        f"{preferences.out_of_scope} Showing movie recommendations instead, "
+        "since that's what I can do:\n\n"
+        if preferences.out_of_scope
+        else ""
+    )
+
+    # A platform constraint can never be availability-checked without a
+    # country (TMDB's discover/watch-providers endpoints both require a
+    # resolved region) — asking ReAct to "figure it out" burns whole passes
+    # producing candidates that verify_recommendation then fails for a
+    # misleading reason (it looks like "not available" when the real problem
+    # is "couldn't check"). Handle it deterministically up front.
+    if preferences.platforms and not preferences.country:
+        if interactive:
+            return (
+                "Which country should I check "
+                f"{', '.join(preferences.platforms)} availability for?",
+                SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
+            )
+        # Non-interactive: must always return something, but there is no
+        # point spending multiple ReAct/Reflection passes on an availability
+        # check that can never succeed — run one pass and disclose plainly
+        # that availability wasn't confirmed, rather than pretending it was.
+        no_country_context = ReactContext(
+            preferences=preferences,
+            interactive=False,
+            use_fallback=False,
+            pass_number=1,
+            is_final_pass=True,
+            excluded=_seed_excluded(prior_state),
+        )
+        draft = await _run_react_with_fallback(no_country_context, steps)
+        response_text = disclosure_prefix + _compose_best_effort(draft, preferences)
+        return response_text, _build_session_state(
+            no_country_context, prior_state, draft.candidates
+        )
+
+    response_text, state = await _run_search_loop(
+        preferences, prior_state, interactive, steps
+    )
+    return disclosure_prefix + response_text, state
+
+
+async def _run_search_loop(
+    preferences: UserPreferences,
+    prior_state: SessionState,
+    interactive: bool,
+    steps: List[dict],
+) -> Tuple[str, SessionState]:
+    """The bounded ReAct <-> Reflection loop, run once country/scope checks
+    above have already passed. Country is guaranteed resolvable here whenever
+    platforms are set, and the request is known to be in-scope."""
     context = ReactContext(
         preferences=preferences,
         feedback=None,
@@ -101,7 +164,30 @@ async def run_pipeline(
             continue
 
         # --- Deterministic availability check (no LLM call) -----------------
-        verified = await _verify_availability(new_candidates, preferences, steps)
+        verify_result = await _verify_availability(new_candidates, preferences, steps)
+
+        if verify_result.get("error") in ("missing_country", "unknown_country"):
+            # Availability can never be confirmed for this country/platform
+            # combo — no amount of retrying the ReAct/Reflection loop fixes
+            # that, so stop burning passes on it (defense in depth: the
+            # missing-country case is normally caught before this loop even
+            # starts, but the country the taste extractor produced may still
+            # fail to resolve to a TMDB region).
+            if interactive and not context.is_final_pass:
+                question = (
+                    verify_result.get("message")
+                    or "I need a valid country to check availability."
+                ) + " What country should I use?"
+                return question, _build_session_state(context, prior_state, [])
+            shown = [
+                c
+                for c in new_candidates
+                if c.tmdb_id not in {e.tmdb_id for e in context.excluded}
+            ]
+            response_text = _compose_best_effort(ReActDraft(candidates=shown), preferences)
+            return response_text, _build_session_state(context, prior_state, shown)
+
+        verified = verify_result.get("results", [])
 
         available: List[dict] = []
         for v in verified:
@@ -197,8 +283,15 @@ async def run_pipeline(
         return _compose_final(context.approved, preferences), _build_session_state(
             context, prior_state, context.approved
         )
-    response_text = _compose_best_effort(draft, preferences)
-    return response_text, _build_session_state(context, prior_state, draft.candidates)
+    # Never present a candidate here that verify_recommendation already
+    # confirmed unavailable or Reflection already rejected — draft.candidates
+    # is just the LAST pass's raw draft, which may be exactly the batch that
+    # just failed verification (see the "None of your candidates were
+    # available" feedback path above).
+    excluded_ids = {e.tmdb_id for e in context.excluded}
+    shown = [c for c in draft.candidates if c.tmdb_id not in excluded_ids]
+    response_text = _compose_best_effort(ReActDraft(candidates=shown), preferences)
+    return response_text, _build_session_state(context, prior_state, shown)
 
 
 def _seed_excluded(prior_state: SessionState) -> List[ExcludedMovie]:
@@ -263,8 +356,14 @@ async def _run_react_with_fallback(
 
 async def _verify_availability(
     candidates: List[Candidate], preferences: UserPreferences, steps: List[dict]
-) -> List[dict]:
-    """Run verify_recommendation directly — deterministic, parallel, no LLM."""
+) -> dict:
+    """Run verify_recommendation directly — deterministic, parallel, no LLM.
+
+    Returns the raw tool result dict (not just the "results" list) so the
+    caller can detect a batch-level "error" (missing/unresolvable country) and
+    stop retrying instead of treating every candidate as individually
+    unavailable for a misleading reason.
+    """
     args = {
         "candidates": [
             {"tmdb_id": c.tmdb_id, "title": c.title} for c in candidates
@@ -272,6 +371,7 @@ async def _verify_availability(
         "country": preferences.country,
         "platforms": preferences.platforms,
         "user_mood": preferences.mood,
+        "exclude_people": preferences.exclude_people,
     }
     result = await verify_recommendation.execute(args)
     log_step(
@@ -281,7 +381,7 @@ async def _verify_availability(
         user_prompt=None,
         response=result,
     )
-    return result.get("results", [])
+    return result
 
 
 def _apply_verdict(
