@@ -198,6 +198,11 @@ _PLATFORM_TO_PROVIDER_ID_LOWER = {
     name.lower(): pid for name, pid in PLATFORM_TO_PROVIDER_ID.items()
 }
 
+# Case-insensitive index over COUNTRY_TO_REGION_CODE, built once at import.
+_COUNTRY_TO_REGION_CODE_LOWER = {
+    name.lower(): code for name, code in COUNTRY_TO_REGION_CODE.items()
+}
+
 
 def resolve_provider_ids(platforms: list[str]) -> list[int]:
     """Map platform display names to TMDB provider IDs, skipping unknowns.
@@ -236,8 +241,9 @@ def resolve_region_code(country: str | None) -> str | None:
     """
     if not country:
         return None
-    if country in COUNTRY_TO_REGION_CODE:
-        return COUNTRY_TO_REGION_CODE[country]
+    code = _COUNTRY_TO_REGION_CODE_LOWER.get(country.strip().lower())
+    if code:
+        return code
     if len(country) == 2:  # already looks like an ISO code
         return country.upper()
     return None
