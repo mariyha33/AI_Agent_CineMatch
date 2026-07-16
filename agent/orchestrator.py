@@ -27,6 +27,7 @@ from agent.steps import log_step
 from agent.taste_extractor import taste_extractor
 from agent.tools import verify_recommendation
 from agent.tools.rag_search import RagUnavailable
+from agent.tools.verify_recommendation import TMDBUnavailable
 
 VERIFY_MODULE = "Orchestrator/verify_recommendation"
 
@@ -126,163 +127,251 @@ async def _run_search_loop(
         is_final_pass=False,
     )
 
-    draft: ReActDraft = ReActDraft()
-    for _pass in range(1, config.MAX_PASSES + 1):
-        context.pass_number = _pass
-        context.is_final_pass = _pass == config.MAX_PASSES
-        context.remaining_needed = max(
-            config.MAX_CANDIDATES - len(context.approved), 1
-        )
-        # The RAG index has no availability signal (mediocre hit rate — see
-        # Agentic loop overhaul below), so from pass 2 on tmdb_fallback_search
-        # (availability-filtered by TMDB itself) becomes available regardless
-        # of what triggered fallback mode so far.
-        if _pass >= 2:
-            context.use_fallback = True
+    # Everything TMDB has ever confirmed as genuinely available THIS run,
+    # regardless of what Reflection later did with it. "Available" (a
+    # deterministic TMDB fact) and "approved" (Reflection's taste judgment)
+    # are different things — a candidate can be genuinely available and still
+    # end up NOT in context.approved (Reflection rejected it on taste, or
+    # left it unaccounted-for and _apply_verdict auto-excluded it). If a
+    # later pass's TMDB check then fails outright, we must still be able to
+    # fall back to a real, confirmed-available movie like this instead of an
+    # error — context.approved alone isn't a reliable enough signal for that.
+    verified_available: List[Candidate] = []
 
-        draft = await _run_react_with_fallback(context, steps)
-
-        # ReAct asked the user a question -> short-circuit (interactive only,
-        # and never on the final pass — there's no more retrying to clarify
-        # into). In non-interactive mode a stray clarification is ignored.
-        if draft.is_clarification and interactive and not context.is_final_pass:
-            question = draft.clarification_question or "Could you clarify your request?"
-            return question, _build_session_state(context, prior_state, [])
-
-        known_ids = {c.tmdb_id for c in context.approved} | {
-            e.tmdb_id for e in context.excluded
-        }
-        new_candidates = [c for c in draft.candidates if c.tmdb_id not in known_ids]
-
-        if not new_candidates:
-            if context.is_final_pass:
-                break
-            context.feedback = (
-                "Your last draft contained no candidates beyond what's already "
-                "approved or excluded. Search for genuinely different movies."
+    def _remember_verified(v: dict, orig: Optional[Candidate]) -> None:
+        if any(c.tmdb_id == v["tmdb_id"] for c in verified_available):
+            return
+        verified_available.append(
+            Candidate(
+                title=v.get("title") or (orig.title if orig else "Unknown"),
+                year=orig.year if orig else None,
+                tmdb_id=v["tmdb_id"],
+                genres=v.get("genres") or (orig.genres if orig else []),
+                overview=v.get("overview") or (orig.overview if orig else None),
+                rationale=orig.rationale if orig else None,
+                platform=v.get("platform"),
             )
-            continue
-
-        # --- Deterministic availability check (no LLM call) -----------------
-        verify_result = await _verify_availability(new_candidates, preferences, steps)
-
-        if verify_result.get("error") in ("missing_country", "unknown_country"):
-            # Availability can never be confirmed for this country/platform
-            # combo — no amount of retrying the ReAct/Reflection loop fixes
-            # that, so stop burning passes on it (defense in depth: the
-            # missing-country case is normally caught before this loop even
-            # starts, but the country the taste extractor produced may still
-            # fail to resolve to a TMDB region).
-            if interactive and not context.is_final_pass:
-                question = (
-                    verify_result.get("message")
-                    or "I need a valid country to check availability."
-                ) + " What country should I use?"
-                return question, _build_session_state(context, prior_state, [])
-            shown = [
-                c
-                for c in new_candidates
-                if c.tmdb_id not in {e.tmdb_id for e in context.excluded}
-            ]
-            response_text = _compose_best_effort(ReActDraft(candidates=shown), preferences)
-            return response_text, _build_session_state(context, prior_state, shown)
-
-        verified = verify_result.get("results", [])
-
-        available: List[dict] = []
-        for v in verified:
-            if v.get("verdict") == "pass":
-                available.append(v)
-            else:
-                context.excluded.append(
-                    ExcludedMovie(
-                        tmdb_id=v["tmdb_id"],
-                        title=v.get("title") or "",
-                        reason=v.get("reason") or "Not available.",
-                    )
-                )
-
-        if not available:
-            if context.is_final_pass:
-                break
-            context.feedback = (
-                "None of your candidates were available on the requested "
-                "platform/country. Search for different, verifiably available "
-                "movies."
-            )
-            context.use_fallback = True
-            continue
-
-        # --- Taste judgment (single LLM call) --------------------------------
-        verdict = await reflection_agent(
-            available,
-            preferences,
-            context.approved,
-            steps,
-            interactive,
-            context.is_final_pass,
         )
 
-        if verdict.decision == "clarify":
-            if interactive and not context.is_final_pass:
-                question = verdict.question or "Could you clarify your request?"
-                return question, _build_session_state(context, prior_state, [])
-            context.feedback = (
-                "Do not ask the user questions. Make reasonable assumptions about "
-                "any missing details and return at least one recommendation."
-            )
-            context.use_fallback = verdict.use_fallback
-            continue
-
-        _apply_verdict(verdict, available, new_candidates, context)
-
-        # Defense in depth: don't let a premature "approve" (below
-        # MIN_CANDIDATES, not the final pass) end the pipeline early just
-        # because the model treated "bank this one hard-constraint match" as
-        # license to stop searching. Reflection's prompt tells it to keep
-        # "decision" at "reject" until enough candidates have accumulated,
-        # but this is a real trace-observed failure mode worth guarding in
-        # code rather than trusting the model's count-math alone.
-        premature_approve = (
-            verdict.decision == "approve"
-            and not context.is_final_pass
-            and len(context.approved) < config.MIN_CANDIDATES
-        )
-
-        if verdict.decision == "approve" and not premature_approve:
-            response_text = verdict.final_response or _compose_final(context.approved, preferences)
-            return response_text, _build_session_state(context, prior_state, context.approved)
-
-        # Enough movies have accumulated approval across passes even though
-        # this pass's overall decision was "reject" (e.g. a mixed batch) ->
-        # stop early instead of spending another ReAct/Reflection round.
-        if len(context.approved) >= config.MAX_CANDIDATES:
+    def _fallback_after_tmdb_failure() -> Optional[Tuple[str, SessionState]]:
+        """Best-effort response to use when a TMDBUnavailable hits partway
+        through the run. Prefers Reflection-approved candidates; falls back to
+        anything merely confirmed-available if nothing was formally approved.
+        Returns None only when NOTHING was ever verified this run — the caller
+        must then let the real error surface, since that's a genuine outage."""
+        if context.approved:
             return _compose_final(context.approved, preferences), _build_session_state(
                 context, prior_state, context.approved
             )
-
-        if context.is_final_pass:
-            break
-
-        if premature_approve:
-            # The model thought it was done, so it likely left "critique"
-            # empty — synthesize feedback rather than running the next pass
-            # with no guidance at all.
-            context.feedback = verdict.critique or (
-                f"You have only {len(context.approved)} approved movie(s) so "
-                f"far, below the required {config.MIN_CANDIDATES}. Keep "
-                "searching for more genuinely new matching movies before "
-                "this can be approved."
+        if verified_available:
+            return _compose_final(verified_available, preferences), _build_session_state(
+                context, prior_state, verified_available
             )
-        else:
-            context.feedback = verdict.critique
-        context.use_fallback = verdict.use_fallback
+        return None
+
+    draft: ReActDraft = ReActDraft()
+    try:
+        for _pass in range(1, config.MAX_PASSES + 1):
+            context.pass_number = _pass
+            context.is_final_pass = _pass == config.MAX_PASSES
+            context.remaining_needed = max(
+                config.MAX_CANDIDATES - len(context.approved), 1
+            )
+            # The RAG index has no availability signal (mediocre hit rate —
+            # see Agentic loop overhaul below), so from pass 2 on
+            # tmdb_fallback_search (availability-filtered by TMDB itself)
+            # becomes available regardless of what triggered fallback mode
+            # so far.
+            if _pass >= 2:
+                context.use_fallback = True
+
+            draft = await _run_react_with_fallback(context, steps)
+
+            # ReAct asked the user a question -> short-circuit (interactive
+            # only, and never on the final pass — there's no more retrying
+            # to clarify into). In non-interactive mode a stray
+            # clarification is ignored.
+            if draft.is_clarification and interactive and not context.is_final_pass:
+                question = draft.clarification_question or "Could you clarify your request?"
+                return question, _build_session_state(context, prior_state, [])
+
+            known_ids = {c.tmdb_id for c in context.approved} | {
+                e.tmdb_id for e in context.excluded
+            }
+            new_candidates = [c for c in draft.candidates if c.tmdb_id not in known_ids]
+
+            if not new_candidates:
+                if context.is_final_pass:
+                    break
+                context.feedback = (
+                    "Your last draft contained no candidates beyond what's "
+                    "already approved or excluded. Search for genuinely "
+                    "different movies."
+                )
+                continue
+
+            # --- Deterministic availability check (no LLM call) -------------
+            # A genuine TMDB request failure (TMDBUnavailable) is allowed to
+            # propagate out of this call rather than being swallowed into a
+            # dict here — it's handled by the single except-clause below,
+            # which is the one place that decides whether this run has
+            # anything worth falling back to.
+            verify_result = await _verify_availability(new_candidates, preferences, steps)
+
+            if verify_result.get("error") in ("missing_country", "unknown_country"):
+                # Availability can never be confirmed for this
+                # country/platform combo — no amount of retrying the
+                # ReAct/Reflection loop fixes that, so stop burning passes on
+                # it (defense in depth: the missing-country case is normally
+                # caught before this loop even starts, but the country the
+                # taste extractor produced may still fail to resolve to a
+                # TMDB region).
+                if interactive and not context.is_final_pass:
+                    question = (
+                        verify_result.get("message")
+                        or "I need a valid country to check availability."
+                    ) + " What country should I use?"
+                    return question, _build_session_state(context, prior_state, [])
+                shown = [
+                    c
+                    for c in new_candidates
+                    if c.tmdb_id not in {e.tmdb_id for e in context.excluded}
+                ]
+                response_text = _compose_best_effort(ReActDraft(candidates=shown), preferences)
+                return response_text, _build_session_state(context, prior_state, shown)
+
+            verified = verify_result.get("results", [])
+            original_by_id = {c.tmdb_id: c for c in new_candidates}
+
+            available: List[dict] = []
+            for v in verified:
+                if v.get("verdict") == "pass":
+                    available.append(v)
+                    _remember_verified(v, original_by_id.get(v["tmdb_id"]))
+                else:
+                    context.excluded.append(
+                        ExcludedMovie(
+                            tmdb_id=v["tmdb_id"],
+                            title=v.get("title") or "",
+                            reason=v.get("reason") or "Not available.",
+                        )
+                    )
+
+            if not available:
+                if context.is_final_pass:
+                    break
+                context.feedback = (
+                    "None of your candidates were available on the requested "
+                    "platform/country. Search for different, verifiably "
+                    "available movies."
+                )
+                context.use_fallback = True
+                continue
+
+            # --- Taste judgment (single LLM call) ----------------------------
+            verdict = await reflection_agent(
+                available,
+                preferences,
+                context.approved,
+                steps,
+                interactive,
+                context.is_final_pass,
+            )
+
+            if verdict.decision == "clarify":
+                if interactive and not context.is_final_pass:
+                    question = verdict.question or "Could you clarify your request?"
+                    return question, _build_session_state(context, prior_state, [])
+                context.feedback = (
+                    "Do not ask the user questions. Make reasonable "
+                    "assumptions about any missing details and return at "
+                    "least one recommendation."
+                )
+                context.use_fallback = verdict.use_fallback
+                continue
+
+            _apply_verdict(verdict, available, new_candidates, context)
+
+            # Deterministic final-pass guard: the Reflection system prompt
+            # says "reject" is not a valid decision on the final pass (§
+            # REFLECTION_FINAL_PASS) and that final_response must always be
+            # composed then — but that's a prompt instruction, not something
+            # the LLM is guaranteed to follow. If it still returns
+            # decision="reject" or omits final_response on the final pass,
+            # never let that surface as a null/lost response when there's
+            # anything genuinely confirmed to fall back to — compose a
+            # deterministic best-effort final response ourselves rather than
+            # trusting the model's compliance.
+            if context.is_final_pass and (
+                verdict.decision != "approve" or not verdict.final_response
+            ):
+                fallback = _fallback_after_tmdb_failure()
+                if fallback is not None:
+                    return fallback
+                # Nothing was ever approved or verified, even on the final
+                # pass — fall through to the loop's own exhausted-passes
+                # best-effort path below rather than returning nothing.
+                break
+
+            # Defense in depth: don't let a premature "approve" (below
+            # MIN_CANDIDATES, not the final pass) end the pipeline early
+            # just because the model treated "bank this one hard-constraint
+            # match" as license to stop searching. Reflection's prompt tells
+            # it to keep "decision" at "reject" until enough candidates have
+            # accumulated, but this is a real trace-observed failure mode
+            # worth guarding in code rather than trusting the model's
+            # count-math alone.
+            premature_approve = (
+                verdict.decision == "approve"
+                and not context.is_final_pass
+                and len(context.approved) < config.MIN_CANDIDATES
+            )
+
+            if verdict.decision == "approve" and not premature_approve:
+                response_text = verdict.final_response or _compose_final(context.approved, preferences)
+                return response_text, _build_session_state(context, prior_state, context.approved)
+
+            # Enough movies have accumulated approval across passes even
+            # though this pass's overall decision was "reject" (e.g. a mixed
+            # batch) -> stop early instead of spending another
+            # ReAct/Reflection round.
+            if len(context.approved) >= config.MAX_CANDIDATES:
+                return _compose_final(context.approved, preferences), _build_session_state(
+                    context, prior_state, context.approved
+                )
+
+            if context.is_final_pass:
+                break
+
+            if premature_approve:
+                # The model thought it was done, so it likely left
+                # "critique" empty — synthesize feedback rather than running
+                # the next pass with no guidance at all.
+                context.feedback = verdict.critique or (
+                    f"You have only {len(context.approved)} approved movie(s) "
+                    f"so far, below the required {config.MIN_CANDIDATES}. "
+                    "Keep searching for more genuinely new matching movies "
+                    "before this can be approved."
+                )
+            else:
+                context.feedback = verdict.critique
+            context.use_fallback = verdict.use_fallback
+    except TMDBUnavailable:
+        # A genuine TMDB request failure hit somewhere in the loop above
+        # (see _verify_availability / verify_recommendation.execute). Never
+        # let that discard something already genuinely confirmed this run —
+        # only let it surface as a real error when NOTHING was ever
+        # verified/approved, which is the one case where "TMDB unavailable"
+        # is actually the honest answer.
+        fallback = _fallback_after_tmdb_failure()
+        if fallback is not None:
+            return fallback
+        raise
 
     # Passes exhausted -> best effort from whatever accumulated.
-    if context.approved:
-        return _compose_final(context.approved, preferences), _build_session_state(
-            context, prior_state, context.approved
-        )
+    fallback = _fallback_after_tmdb_failure()
+    if fallback is not None:
+        return fallback
     # Never present a candidate here that verify_recommendation already
     # confirmed unavailable or Reflection already rejected — draft.candidates
     # is just the LAST pass's raw draft, which may be exactly the batch that
@@ -360,9 +449,19 @@ async def _verify_availability(
     """Run verify_recommendation directly — deterministic, parallel, no LLM.
 
     Returns the raw tool result dict (not just the "results" list) so the
-    caller can detect a batch-level "error" (missing/unresolvable country) and
-    stop retrying instead of treating every candidate as individually
-    unavailable for a misleading reason.
+    caller can detect a batch-level "error" (missing/unresolvable country)
+    and react appropriately instead of treating every candidate as
+    individually unavailable for a misleading reason.
+
+    TMDBUnavailable (raised by verify_recommendation.execute only when every
+    candidate in THIS batch failed to even reach TMDB — see that module) is
+    logged here (so the trace stays honest about what actually happened) but
+    then re-raised rather than swallowed into the return value. It propagates
+    up to _run_search_loop's single try/except, which is the one place that
+    decides whether this run has anything genuinely confirmed to fall back
+    on (something already approved, or something merely verified-available)
+    or whether nothing was ever verified at all — in which case surfacing
+    the real error is the honest thing to do.
     """
     args = {
         "candidates": [
@@ -373,7 +472,17 @@ async def _verify_availability(
         "user_mood": preferences.mood,
         "exclude_people": preferences.exclude_people,
     }
-    result = await verify_recommendation.execute(args)
+    try:
+        result = await verify_recommendation.execute(args)
+    except TMDBUnavailable as exc:
+        log_step(
+            steps,
+            module=VERIFY_MODULE,
+            system_prompt=None,
+            user_prompt=None,
+            response={"error": "tmdb_unavailable", "message": str(exc), "results": [], "count": 0},
+        )
+        raise
     log_step(
         steps,
         module=VERIFY_MODULE,
@@ -439,9 +548,24 @@ def _apply_verdict(
 
 
 def _compose_final(approved: List[Candidate], preferences: UserPreferences) -> str:
-    """Format the accumulated, availability-confirmed, taste-approved list."""
+    """Format the accumulated, availability-confirmed, taste-approved list.
+
+    When fewer than MIN_CANDIDATES were found, say so honestly up front
+    rather than silently presenting a short list as if it were a full one —
+    the platform/country combination genuinely has limited matches for this
+    request, and the user should know that's why the list is short.
+    """
     country = preferences.country or "your region"
     lines: List[str] = []
+    if 0 < len(approved) < config.MIN_CANDIDATES:
+        platform_label = (
+            ", ".join(preferences.platforms) if preferences.platforms else "your requested service"
+        )
+        lines.append(
+            f"Heads up: {platform_label} in {country} has limited matches for this "
+            "request — here's what I could confirm is actually available:"
+        )
+        lines.append("")
     for c in approved[: config.MAX_CANDIDATES]:
         year = f" ({c.year})" if c.year else ""
         rationale = c.rationale or "Matches the taste you described."

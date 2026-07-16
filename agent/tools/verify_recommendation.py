@@ -223,7 +223,15 @@ async def execute(args: dict) -> dict:
 
     results = [r for r in settled if r is not None]
 
-    # If we had candidates but every single one errored out, TMDB is likely down.
+    # If we had candidates but every single one errored out (a genuine TMDB
+    # request failure — see _verify_one's except clause), TMDB is likely down.
+    # This must NOT fire just because candidates came back unavailable or
+    # below the caller's match bar: _verify_one still returns a normal dict
+    # with verdict="fail" for those (they land in `results`), it only returns
+    # None on a real request exception. So `results` being empty here means
+    # every request itself failed, not "nothing passed availability" — the
+    # caller (agent/orchestrator.py) additionally makes sure this exception
+    # never discards candidates a PREVIOUS batch already verified/approved.
     if candidates and not results:
         raise TMDBUnavailable(
             "Movie database (TMDB) is currently unavailable. Please try again later."
