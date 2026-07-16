@@ -52,12 +52,12 @@ async def index():
 @app.get("/api/team_info")
 async def team_info() -> dict:
     return {
-        "group_batch_order_number": "PLACEHOLDER",
-        "team_name": "CineMatch",
+        "group_batch_order_number": "Batch1_05_oded_maria_afik",
+        "team_name": "Oded_Afik_Mariya",
         "students": [
-            {"name": "Student A", "email": "a@example.com"},
-            {"name": "Student B", "email": "b@example.com"},
-            {"name": "Student C", "email": "c@example.com"},
+            {"name": "Mariya Halaby", "email": "mariyaspace@campus.technion.ac.il"},
+            {"name": "Oded Katz", "email": "oded.katz@campus.technion.ac.il"},
+            {"name": "Afik Yarimi", "email": "AfikYarimi@gmail.com"},
         ],
     }
 
