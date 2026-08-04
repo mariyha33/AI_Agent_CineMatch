@@ -32,7 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_ARCHITECTURE_PNG = os.path.join(_ROOT, "public", "architecture.png")
+_ARCHITECTURE_PNG = os.path.join(_ROOT, "architecture_image", "cinematch_architecture.png")
 _INDEX_HTML = os.path.join(_ROOT, "public", "index.html")
 
 
@@ -78,7 +78,7 @@ async def model_architecture():
                 "status": "error",
                 "error": (
                     "Architecture diagram not found. Place the PNG at "
-                    "public/architecture.png."
+                    "architecture_image/cinematch_architecture.png."
                 ),
             },
         )

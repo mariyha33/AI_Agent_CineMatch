@@ -12,6 +12,8 @@ live availability check first. Movies only — no TV.
 You tell CineMatch what you're in the mood for — in natural language or as a
 short structured brief — for example:
 
+
+
 > *"Slow-burn crime like Sicario, on Netflix in Israel. I've already seen
 > Prisoners."*
 
@@ -218,7 +220,7 @@ A single FastAPI app deployed as one Vercel Python serverless function.
 | GET  | `/` | Serves the chat UI (`public/index.html`) |
 | GET  | `/api/team_info` | Student/team details |
 | GET  | `/api/agent_info` | Description, purpose, prompt template, worked examples + step traces |
-| GET  | `/api/model_architecture` | Architecture diagram PNG (404 until you add it) |
+| GET  | `/api/model_architecture` | Architecture diagram PNG |
 | POST | `/api/execute` | Main entry point — returns `response` + full `steps` trace + `state` |
 
 `POST /api/execute` request body:
@@ -415,29 +417,5 @@ automatically.
 | File | Role |
 |---|---|
 | [public/index.html](public/index.html) | The entire chat UI — one self-contained file, served at `/`. |
-| `public/architecture.png` | Architecture diagram PNG — **you must add this** (see below). |
+| [architecture_image/cinematch_architecture.png](architecture_image/cinematch_architecture.png) | Architecture diagram PNG, served by `GET /api/model_architecture`. |
 
----
-
-## 5. What's left to do
-
-Measured against [markdown_files/Project instructions.md](markdown_files/Project%20instructions.md),
-the core is complete: all four required endpoints exist, the GUI is built with
-no auth guards and displays both the response and the full step trace, the
-pipeline is optimized (deterministic control flow, minimal LLM calls, parallel
-tool/verify calls), and it's Vercel-ready. Remaining gaps:
-
-1. **Architecture diagram (required).** `GET /api/model_architecture` returns a
-   404 until you drop a PNG at `public/architecture.png`. The instructions
-   require it to be clear and to use **exactly** the module names the code and
-   `steps` trace use (see the list in §2). — *Not yet present.*
-
-2. **Real team info (required).** [api/index.py](api/index.py) `/api/team_info`
-   still returns placeholders (`"PLACEHOLDER"`, `Student A/B/C`,
-   `a@example.com`). Replace with real names, emails, and the
-   `{batch#}_{order#}` group number from the presentation list.
-
-3. **Improve and test single-turn prompts.** The current prompt template is a first-pass draft. It works
-   but is not yet polished for clarity, brevity, and robustness. The worked
-   examples in [agent/agent_info.py](agent/agent_info.py) are a good starting
-   point for testing.

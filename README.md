@@ -39,7 +39,7 @@ architecture diagram: `TasteExtractor`, `ReActAgent`, `ReActAgent/rag_search`,
 |---|---|---|
 | GET  | `/api/team_info`          | Student/team details |
 | GET  | `/api/agent_info`         | Description, purpose, prompt template, examples |
-| GET  | `/api/model_architecture` | Architecture diagram (PNG) |
+| GET  | `/api/model_architecture` | Architecture diagram (PNG, from `architecture_image/`) |
 | POST | `/api/execute`            | Main entry point — returns response + full step trace |
 
 `POST /api/execute` body:
@@ -250,9 +250,8 @@ First time deploying to Vercel? Follow these steps in order.
 
 This repo is the **backend**. To make it fully production-ready:
 
-1. **Architecture diagram** — drop your PNG at `public/architecture.png`. Until
-   then `GET /api/model_architecture` returns a clear 404. Names in the diagram
-   must match the module names listed above.
+1. ~~Architecture diagram~~ — done: served from
+   `architecture_image/cinematch_architecture.png` by `GET /api/model_architecture`.
 2. **Fill real credentials** in `.env` (and Vercel): LLMod.ai key, TMDB key,
    Supabase URL + key, Pinecone key + index name. The Pinecone index
    (`cinematch-movies`) is assumed to already exist and be populated.
@@ -311,7 +310,7 @@ agent/models.py           Pydantic data shapes
 agent/prompts.py          All system prompts + user prompt template
 agent/config.py           Env vars + tunable parameters
 public/index.html         Minimal chat UI (frontend, served at /)
-public/architecture.png   (you provide this)
+architecture_image/cinematch_architecture.png   Architecture diagram (served via /api/model_architecture)
 ```
 
 ---
