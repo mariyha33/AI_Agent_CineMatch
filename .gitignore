@@ -8,5 +8,6 @@ env/
 .vercel
 .pytest_cache/
 .DS_Store
-.envdata/processed/rag_documents.jsonl
-.data/processed/rag_documents.jsonl
+data/processed/rag_documents.jsonl
+data/processed/rag_documents*.jsonl
+data/cache/
