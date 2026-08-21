@@ -66,17 +66,55 @@ async def run_pipeline(
         else ""
     )
 
-    # A platform constraint can never be availability-checked without a
-    # country (TMDB's discover/watch-providers endpoints both require a
-    # resolved region) — asking ReAct to "figure it out" burns whole passes
-    # producing candidates that verify_recommendation then fails for a
-    # misleading reason (it looks like "not available" when the real problem
-    # is "couldn't check"). Handle it deterministically up front.
-    if preferences.platforms and not preferences.country:
+    # Availability can never be checked without BOTH a country and at least
+    # one platform (TMDB's discover/watch-providers endpoints require a
+    # resolved region + provider). Letting ReAct/TMDB run anyway doesn't fail
+    # loudly — verify_recommendation just finds nothing matches an empty
+    # platform list, every candidate comes back "unavailable", and the run
+    # ends in the misleading generic "couldn't find a match, try loosening a
+    # constraint" message even though the user gave no constraint to loosen
+    # in the first place. Ask for whatever's missing deterministically, up
+    # front, instead of burning a search on a request that can't succeed.
+    missing_country = not preferences.country
+    missing_platforms = not preferences.platforms
+    if missing_country or missing_platforms:
         if interactive:
+            if missing_country and missing_platforms:
+                question = (
+                    "To recommend movies that are actually available for you, "
+                    "please tell me:\n"
+                    "1. Which country are you in?\n"
+                    "2. Which streaming platform(s) do you have? For example: "
+                    "Netflix, Disney+, Amazon Prime Video.\n"
+                    "3. Optionally, what mood or genre are you in the mood for?"
+                )
+            elif missing_country:
+                question = (
+                    "Which country should I check "
+                    f"{', '.join(preferences.platforms)} availability for?"
+                )
+            else:
+                question = (
+                    "Which streaming platform(s) do you have in "
+                    f"{preferences.country}? For example: Netflix, Disney+, "
+                    "Amazon Prime Video."
+                )
+            # Deterministic, not an LLM/ReAct decision — logged honestly under
+            # the Orchestrator so the trace still shows why clarification was
+            # needed, without claiming a ReActAgent tool call that never ran.
+            log_step(
+                steps,
+                module="Orchestrator/clarify_missing_fields",
+                system_prompt=None,
+                user_prompt=None,
+                response={
+                    "missing_country": missing_country,
+                    "missing_platforms": missing_platforms,
+                    "question": question,
+                },
+            )
             return (
-                "Which country should I check "
-                f"{', '.join(preferences.platforms)} availability for?",
+                question,
                 SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
             )
         # Non-interactive: must always return something, but there is no
