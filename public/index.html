@@ -470,8 +470,10 @@
           stepEl.appendChild(el("summary", { text: step.module || "(unknown step)" }));
 
           const prompt = step.prompt || {};
+          const sys = stepFieldBlock("System prompt", prompt.system_prompt, true);
           const usr = stepFieldBlock("User prompt", prompt.user_prompt, true);
           const resp = stepFieldBlock("Response", step.response, true);
+          if (sys) stepEl.appendChild(sys);
           if (usr) stepEl.appendChild(usr);
           if (resp) stepEl.appendChild(resp);
 
