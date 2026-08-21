@@ -9,6 +9,7 @@ instead of re-finding ones already accepted or ruled out.
 """
 from __future__ import annotations
 
+import json
 from typing import List, Optional, Tuple
 
 from agent import config
@@ -25,7 +26,7 @@ from agent.react_agent import react_agent
 from agent.reflection_agent import reflection_agent
 from agent.steps import log_step
 from agent.taste_extractor import taste_extractor
-from agent.tools import verify_recommendation
+from agent.tools import ask_user_clarification, verify_recommendation
 from agent.tools.rag_search import RagUnavailable
 from agent.tools.verify_recommendation import TMDBUnavailable
 
@@ -68,71 +69,52 @@ async def run_pipeline(
 
     # Availability can never be checked without BOTH a country and at least
     # one platform (TMDB's discover/watch-providers endpoints require a
-    # resolved region + provider). Letting ReAct/TMDB run anyway doesn't fail
-    # loudly — verify_recommendation just finds nothing matches an empty
-    # platform list, every candidate comes back "unavailable", and the run
-    # ends in the misleading generic "couldn't find a match, try loosening a
-    # constraint" message even though the user gave no constraint to loosen
-    # in the first place. Ask for whatever's missing deterministically, up
-    # front, instead of burning a search on a request that can't succeed.
+    # resolved region + provider). Recommending anyway — even flagged as a
+    # "best guess" with an unconfirmed platform/region — defeats the whole
+    # point of this agent (verified availability), so this is asked for
+    # unconditionally: no RAG/TMDB call happens at all until both are known,
+    # regardless of whether the caller is interactive or not.
     missing_country = not preferences.country
     missing_platforms = not preferences.platforms
     if missing_country or missing_platforms:
-        if interactive:
-            if missing_country and missing_platforms:
-                question = (
-                    "To recommend movies that are actually available for you, "
-                    "please tell me:\n"
-                    "1. Which country are you in?\n"
-                    "2. Which streaming platform(s) do you have? For example: "
-                    "Netflix, Disney+, Amazon Prime Video.\n"
-                    "3. Optionally, what mood or genre are you in the mood for?"
-                )
-            elif missing_country:
-                question = (
-                    "Which country should I check "
-                    f"{', '.join(preferences.platforms)} availability for?"
-                )
-            else:
-                question = (
-                    "Which streaming platform(s) do you have in "
-                    f"{preferences.country}? For example: Netflix, Disney+, "
-                    "Amazon Prime Video."
-                )
-            # Deterministic, not an LLM/ReAct decision — logged honestly under
-            # the Orchestrator so the trace still shows why clarification was
-            # needed, without claiming a ReActAgent tool call that never ran.
-            log_step(
-                steps,
-                module="Orchestrator/clarify_missing_fields",
-                system_prompt=None,
-                user_prompt=None,
-                response={
-                    "missing_country": missing_country,
-                    "missing_platforms": missing_platforms,
-                    "question": question,
-                },
+        if missing_country and missing_platforms:
+            question = (
+                "To recommend movies that are actually available for you, "
+                "please tell me:\n"
+                "1. Which country are you in?\n"
+                "2. Which streaming platform(s) do you have? For example: "
+                "Netflix, Disney+, Amazon Prime Video.\n"
+                "3. Optionally, what mood or genre are you in the mood for?"
             )
-            return (
-                question,
-                SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
+        elif missing_country:
+            question = (
+                "Which country should I check "
+                f"{', '.join(preferences.platforms)} availability for?"
             )
-        # Non-interactive: must always return something, but there is no
-        # point spending multiple ReAct/Reflection passes on an availability
-        # check that can never succeed — run one pass and disclose plainly
-        # that availability wasn't confirmed, rather than pretending it was.
-        no_country_context = ReactContext(
-            preferences=preferences,
-            interactive=False,
-            use_fallback=False,
-            pass_number=1,
-            is_final_pass=True,
-            excluded=_seed_excluded(prior_state),
+        else:
+            question = (
+                "Which streaming platform(s) do you have in "
+                f"{preferences.country}? For example: Netflix, Disney+, "
+                "Amazon Prime Video."
+            )
+        # Route through the real ask_user_clarification tool (deterministic,
+        # no external call — see agent/tools/ask_user_clarification.py)
+        # instead of the LLM-driven ReAct loop: the missing field(s) are
+        # already known for certain, so an LLM decision would only add cost,
+        # not information. Logged under the tool's real module name so the
+        # trace honestly reflects that it actually ran.
+        clarify_args = {"question": question}
+        clarify_result = await ask_user_clarification.execute(clarify_args)
+        log_step(
+            steps,
+            module="ReActAgent/ask_user_clarification",
+            system_prompt=None,
+            user_prompt=json.dumps(clarify_args, ensure_ascii=False),
+            response=clarify_result,
         )
-        draft = await _run_react_with_fallback(no_country_context, steps)
-        response_text = disclosure_prefix + _compose_best_effort(draft, preferences)
-        return response_text, _build_session_state(
-            no_country_context, prior_state, draft.candidates
+        return (
+            question,
+            SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
         )
 
     response_text, state = await _run_search_loop(
