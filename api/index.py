@@ -101,7 +101,6 @@ async def execute(req: ExecuteRequest) -> dict:
             "error": None,
             "response": response_text,
             "steps": steps,
-            "state": state.model_dump(),
         }
         _log_run(req, response_text, steps, "ok", None)
         return result
