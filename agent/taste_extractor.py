@@ -22,6 +22,30 @@ MODULE = "TasteExtractor"
 # Fields that mark a payload as "already structured" preferences.
 _PREF_KEYS = set(UserPreferences.model_fields.keys())
 
+# List fields that must be [] rather than None — the taste-extractor prompt
+# tells the LLM to return null for anything it can't determine, and
+# country/platforms are the two fields most often genuinely missing. Pydantic
+# only applies its default (empty list) to an OMITTED key, not an explicit
+# null, so an explicit null here previously reached UserPreferences and raised
+# a ValidationError ("Input should be a valid list") instead of letting the
+# orchestrator's missing-country/platform check run and ask for clarification.
+_NULLABLE_LIST_FIELDS = ("genres", "themes", "similar_to", "exclude", "exclude_people", "platforms")
+
+
+def _normalize_preferences_data(data):
+    """Coerce explicit `null` on list fields to `[]` before constructing
+    UserPreferences. Scalar optional fields (mood, country, year_min,
+    year_max, min_rating, vote_count_min, vote_count_max, out_of_scope) are
+    left untouched — null is their normal, valid "not provided" value.
+    Non-dict input is returned unchanged so the existing TypeError path in
+    the caller still fires exactly as before."""
+    if not isinstance(data, dict):
+        return data
+    for key in _NULLABLE_LIST_FIELDS:
+        if key in data and data[key] is None:
+            data[key] = []
+    return data
+
 
 def _try_structured_bypass(prompt: str) -> Optional[UserPreferences]:
     """Return UserPreferences if the prompt is already structured JSON, else None."""
@@ -35,7 +59,7 @@ def _try_structured_bypass(prompt: str) -> Optional[UserPreferences]:
     if not (set(data.keys()) & _PREF_KEYS) or (set(data.keys()) - _PREF_KEYS):
         return None
     try:
-        return UserPreferences(**data)
+        return UserPreferences(**_normalize_preferences_data(data))
     except ValidationError:
         return None
 
@@ -99,7 +123,7 @@ async def _call_and_parse(messages: List[dict], retry: bool) -> UserPreferences:
     content = resp.choices[0].message.content or ""
     try:
         data = parse_json_object(content)
-        return UserPreferences(**data)
+        return UserPreferences(**_normalize_preferences_data(data))
     except (json.JSONDecodeError, ValidationError, TypeError) as exc:
         if not retry:
             raise

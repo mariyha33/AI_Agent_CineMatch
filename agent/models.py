@@ -3,7 +3,17 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# List fields on UserPreferences that must never be None — the taste-extractor
+# LLM is instructed to null out fields it can't determine (see
+# TASTE_EXTRACTOR_SYSTEM_PROMPT), and country/platforms are the two fields
+# that are genuinely, legitimately missing most often. Field(default_factory=
+# list) only covers an OMITTED key; it does not coerce an explicit `null`,
+# which is what previously reached Pydantic and raised
+# "Input should be a valid list [type=list_type]" instead of the intended
+# clarification flow.
+_LIST_FIELDS = ("genres", "themes", "similar_to", "exclude", "exclude_people", "platforms")
 
 
 # --- Stage 0: parsed user taste ----------------------------------------------
@@ -38,6 +48,14 @@ class UserPreferences(BaseModel):
     # episodes/seasons) — a short reason the orchestrator can disclose to the
     # user instead of silently substituting movies for the actual ask.
     out_of_scope: Optional[str] = None
+
+    @field_validator(*_LIST_FIELDS, mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, v):
+        """Defense in depth: a None here (e.g. LLM returned "platforms": null)
+        becomes an empty list instead of failing validation. Any non-None
+        value passes through unchanged so real validation errors still surface."""
+        return [] if v is None else v
 
 
 # --- Stage 1: ReAct draft ----------------------------------------------------
