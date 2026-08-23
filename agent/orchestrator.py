@@ -597,24 +597,44 @@ def _compose_final(approved: List[Candidate], preferences: UserPreferences) -> s
         lines.append("")
     return "\n".join(lines).strip()
 
-
 def _compose_best_effort(draft: ReActDraft, preferences: UserPreferences) -> str:
-    """Format whatever candidates we have when nothing was ever approved."""
+    """Format unverified candidates only when no streaming platform was requested.
+
+    If the user explicitly requested a platform, never imply that an
+    unverified candidate may be available there. Streaming availability is a
+    hard constraint and must be confirmed before recommending a title.
+    """
+    if preferences.platforms:
+        platform = ", ".join(preferences.platforms)
+
+        if not preferences.country:
+            return (
+                f"I couldn't verify availability on {platform} because I don't "
+                "have a valid country or region. Please provide a country so I "
+                "can check what's actually available."
+            )
+
+        return (
+            f"I couldn't verify any matching titles available on {platform} "
+            f"in {preferences.country}. Try another streaming service, country, "
+            "or loosen another constraint."
+        )
+
     if not draft.candidates:
         return (
             "I couldn't find a confident match for your request. Try loosening a "
-            "constraint (platform, country, year, or rating) and asking again."
+            "constraint (year, rating, genre, or another preference) and asking again."
         )
-    country = preferences.country or "your region"
-    platform = preferences.platforms[0] if preferences.platforms else "a supported service"
+
     lines: List[str] = [
-        "Here are my best guesses (availability not fully confirmed):",
+        "Here are my best guesses:",
         "",
     ]
+
     for c in draft.candidates[: config.MAX_CANDIDATES]:
         year = f" ({c.year})" if c.year else ""
         rationale = c.rationale or "Matches the taste you described."
         lines.append(f"**{c.title}{year}** — {rationale}")
-        lines.append(f"↳ Possibly on {platform} — {country}")
         lines.append("")
+
     return "\n".join(lines).strip()
