@@ -50,22 +50,23 @@ async def run_pipeline(
     prior_state = prior_state or SessionState()
 
     # A request for something CineMatch fundamentally can't serve (TV
-    # episodes, etc.) must be disclosed, not silently answered with movies as
-    # if that's what was asked. Interactively, ask before burning any passes;
-    # non-interactively (must always return something), disclose up front and
-    # proceed with the movie pipeline anyway.
-    if preferences.out_of_scope and interactive:
+    # episodes, etc.) must be disclosed immediately and must never enter the
+    # movie search pipeline at all — for BOTH interactive and non-interactive
+    # callers. Previously this short-circuit only fired when `interactive`,
+    # so a non-interactive/raw call with `out_of_scope` set fell through into
+    # the full RAG/TMDB/Reflection pipeline for a request CineMatch can't
+    # serve in the first place.
+    if preferences.out_of_scope:
+        if interactive:
+            return (
+                f"{preferences.out_of_scope} I can look for movies with a similar "
+                "feel instead — want me to try that?",
+                SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
+            )
         return (
-            f"{preferences.out_of_scope} I can look for movies with a similar "
-            "feel instead — want me to try that?",
+            preferences.out_of_scope,
             SessionState(excluded=prior_state.excluded, recommended=prior_state.recommended),
         )
-    disclosure_prefix = (
-        f"{preferences.out_of_scope} Showing movie recommendations instead, "
-        "since that's what I can do:\n\n"
-        if preferences.out_of_scope
-        else ""
-    )
 
     # Availability can never be checked without BOTH a country and at least
     # one platform (TMDB's discover/watch-providers endpoints require a
@@ -120,7 +121,7 @@ async def run_pipeline(
     response_text, state = await _run_search_loop(
         preferences, prior_state, interactive, steps
     )
-    return disclosure_prefix + response_text, state
+    return response_text, state
 
 
 async def _run_search_loop(
@@ -354,8 +355,14 @@ async def _run_search_loop(
             # Enough movies have accumulated approval across passes even
             # though this pass's overall decision was "reject" (e.g. a mixed
             # batch) -> stop early instead of spending another
-            # ReAct/Reflection round.
-            if len(context.approved) >= config.MAX_CANDIDATES:
+            # ReAct/Reflection round. This runs after _apply_verdict() above,
+            # so only candidates Reflection actually approved this pass (and
+            # that already passed deterministic availability verification)
+            # count toward the threshold. Previously this only checked
+            # MAX_CANDIDATES, so a "reject" verdict with exactly
+            # MIN_CANDIDATES already banked (the honest minimum) triggered an
+            # unnecessary extra ReAct/Reflection pass instead of finalizing.
+            if len(context.approved) >= config.MIN_CANDIDATES:
                 return _compose_final(context.approved, preferences), _build_session_state(
                     context, prior_state, context.approved
                 )

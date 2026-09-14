@@ -83,12 +83,23 @@ class LocalRagClient:
 
         `filter` mirrors the subset of the Pinecone filter shape used by
         rag_search: {"genres": {"$in": [...]}, "year": {"$gte":, "$lte":},
-        "score": {"$gte":}}.
+        "score": {"$gte":}, "vote_count": {"$gte":, "$lte":}}.
+
+        vote_count bounds are applied here, in the per-doc loop below, BEFORE
+        the `scored[:top_k]` truncation a few lines down — not as a
+        post-retrieval filter on an already-truncated result set. Without
+        this, a handful of highly-similar-but-out-of-range documents could
+        fill the whole top_k before a slightly-less-similar, in-range
+        document ever got a chance (see agent/tools/rag_search.py's
+        _apply_vote_count_bounds, which still runs afterward too, as defense
+        in depth for backends/documents that can't apply this filter
+        themselves).
         """
         docs = self._load()
         genres_filter = None
         year_gte = year_lte = None
         score_gte = None
+        vote_count_gte = vote_count_lte = None
         if filter:
             if "genres" in filter and "$in" in filter["genres"]:
                 genres_filter = set(filter["genres"]["$in"])
@@ -97,6 +108,9 @@ class LocalRagClient:
                 year_lte = filter["year"].get("$lte")
             if "score" in filter:
                 score_gte = filter["score"].get("$gte")
+            if "vote_count" in filter:
+                vote_count_gte = filter["vote_count"].get("$gte")
+                vote_count_lte = filter["vote_count"].get("$lte")
 
         scored: List[tuple] = []
         for doc in docs:
@@ -108,6 +122,11 @@ class LocalRagClient:
             if year_lte is not None and (year is None or year > year_lte):
                 continue
             if score_gte is not None and (doc.get("score") is None or doc.get("score") < score_gte):
+                continue
+            vote_count = doc.get("vote_count")
+            if vote_count_gte is not None and (vote_count is None or vote_count < vote_count_gte):
+                continue
+            if vote_count_lte is not None and (vote_count is None or vote_count > vote_count_lte):
                 continue
             sim = _cosine_similarity(vector, doc["embedding"])
             scored.append((sim, doc))
@@ -129,6 +148,14 @@ class LocalRagClient:
                         "score": doc.get("score"),
                         "overview": doc.get("overview"),
                         "runtime": doc.get("runtime"),
+                        # Phase 2 enrichment fields — absent on documents built
+                        # before enrichment existed, hence the .get() defaults;
+                        # never crashes on an old/un-enriched rag_documents.jsonl.
+                        "decade": doc.get("decade"),
+                        "director": doc.get("director"),
+                        "keywords": doc.get("keywords", []),
+                        "vote_count": doc.get("vote_count"),
+                        "vote_average": doc.get("vote_average"),
                     },
                 }
             )
