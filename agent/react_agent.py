@@ -46,12 +46,44 @@ def _allowed_tools(context: ReactContext, rag_remaining: bool) -> List[str]:
     return tools
 
 
+# Preference fields relevant to CONTENT/taste retrieval only. Deliberately
+# excludes "country" and "platforms" (and "out_of_scope", handled upstream of
+# this stage): availability is a downstream, deterministic concern that this
+# agent never needs to reason about — tmdb_fallback_search's country/platforms
+# args are server-injected directly in _run_tool below (they aren't even in
+# its tool SCHEMA for the model to fill in), and verify_recommendation gets
+# them straight from the orchestrator. Structurally leaving these two fields
+# out of the JSON the model ever sees (rather than just telling it not to use
+# them in a query) closes off the possibility of them leaking into a
+# rag_search query_text or a tmdb_fallback_search keyword.
+_CONTENT_PREFERENCE_FIELDS = (
+    "mood",
+    "genres",
+    "themes",
+    "similar_to",
+    "exclude",
+    "exclude_people",
+    "year_min",
+    "year_max",
+    "min_rating",
+    "vote_count_min",
+    "vote_count_max",
+)
+
+
+def _content_preferences(prefs) -> dict:
+    """UserPreferences reduced to content/taste fields, with country/platforms
+    structurally removed — see _CONTENT_PREFERENCE_FIELDS."""
+    dumped = prefs.model_dump()
+    return {key: dumped[key] for key in _CONTENT_PREFERENCE_FIELDS if key in dumped}
+
+
 def _build_user_context(context: ReactContext) -> str:
     prefs = context.preferences
     needed = context.remaining_needed or config.MIN_CANDIDATES
     return (
         "User preferences (JSON):\n"
-        + json.dumps(prefs.model_dump(), ensure_ascii=False)
+        + json.dumps(_content_preferences(prefs), ensure_ascii=False)
         + f"\n\nFind at least {needed} NEW matching movie(s) (a couple extra as "
         + "buffer is fine in case some turn out to be unavailable — but every "
         + "candidate, including buffers, must still satisfy all hard theme "
@@ -118,6 +150,28 @@ async def _run_tool(
         # silently produce wrong availability results.
         args["country"] = context.preferences.country
         args["platforms"] = context.preferences.platforms
+
+    if name == "rag_search":
+        prefs = context.preferences
+        # Server-injected rather than trusted from the model (same pattern as
+        # tmdb_fallback_search above): an explicit vote_count_min/max is a
+        # real user constraint and must never be silently dropped or
+        # forgotten by the ReAct model on a given call.
+        args["vote_count_min"] = prefs.vote_count_min
+        args["vote_count_max"] = prefs.vote_count_max
+        # Deterministic niche detection from structured preferences — no
+        # extra LLM call. vote_count_max is CineMatch's existing structured
+        # signal for an obscure/indie/"fewer votes" request (see
+        # TASTE_EXTRACTOR_SYSTEM_PROMPT's vote_count_max field), so its mere
+        # presence is used to FORCE prioritize_niche=True here, rather than
+        # relying on the model to also separately remember to set the flag
+        # itself. This can only turn the flag ON, never OFF: if the model
+        # already set it true for some other reason (e.g. "lesser-known" in
+        # the mood text) with no vote_count_max present, that's preserved.
+        if prefs.vote_count_max is not None:
+            args["prioritize_niche"] = True
+        else:
+            args["prioritize_niche"] = bool(args.get("prioritize_niche"))
 
     try:
         result = await registry.get_executor(name)(args)

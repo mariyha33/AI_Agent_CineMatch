@@ -2,8 +2,9 @@
 
 Reads ONLY data/processed/canonical_movies.csv (never unmatched_movies.csv —
 those rows have no verified tmdb_id and must never be recommended). For every
-row it builds a short text description, embeds it via LLMod.ai
-(LLMOD_EMBEDDING_MODEL), and writes one JSON object per line to
+row it optionally enriches metadata (decade/director/keywords/vote stats —
+see enrich_rows/--enrich-tmdb below), builds a text description, embeds it via
+LLMod.ai (LLMOD_EMBEDDING_MODEL), and writes one JSON object per line to
 data/processed/rag_documents.jsonl (or RAG_DOCUMENTS_PATH).
 
 This file is what agent/clients/local_rag_client.py searches when
@@ -16,6 +17,16 @@ Usage:
     python scripts/build_rag_index.py --limit 20            # smoke test, no cost
     python scripts/build_rag_index.py --limit 20 --mock-embeddings  # zero API calls
     python scripts/build_rag_index.py --upsert-pinecone      # also push to Pinecone
+
+Metadata enrichment (decade/director/keywords/vote_count/vote_average — see
+Phase 2, agent/tools/rag_search.py):
+    python scripts/build_rag_index.py --limit 20 --enrich-tmdb            # real TMDB calls, needs TMDB_API_KEY
+    python scripts/build_rag_index.py --limit 20 --enrich-tmdb --mock-tmdb-enrich  # zero API calls, deterministic fixture data
+Enrichment is opt-in and additive: without --enrich-tmdb, rows simply carry
+director=None/keywords=[]/vote_count=None/vote_average=None, and the rest of
+the pipeline (embedding text, storage, rag_search) tolerates that fine. A row
+that already carries director/keywords (e.g. from an already-enriched source)
+is never re-fetched.
 
 Safe to re-run: existing tmdb_ids already present in the output file are
 skipped by default (use --overwrite to rebuild from scratch). Never modifies
@@ -39,6 +50,13 @@ if _ROOT not in sys.path:
 from agent import config  # noqa: E402
 
 DEFAULT_INPUT = os.path.join(_ROOT, "data", "processed", "canonical_movies.csv")
+
+# Hard cap on how many keyword/theme tags a single movie can carry into
+# embedding text and stored metadata — applied everywhere a keywords list is
+# produced or read (TMDB fetch, CSV load, and defensively again right before
+# embedding), so one unusually keyword-heavy movie can never blow up
+# embedding text size or per-document metadata size.
+MAX_KEYWORDS = 15
 
 
 def _resolve_output_path(path: str) -> str:
@@ -65,10 +83,23 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _parse_genres(value: Any) -> List[str]:
+def _parse_list(value: Any) -> List[str]:
     if not value:
         return []
     return [g.strip() for g in str(value).split(",") if g.strip()]
+
+
+# Kept as a separate name for readability at call sites — same comma-split
+# logic as _parse_list.
+_parse_genres = _parse_list
+
+
+def _decade_label(year: Optional[int]) -> Optional[str]:
+    """e.g. 1994 -> '1990s'. None in, None out — never guess a decade for a
+    movie with no known release year."""
+    if year is None:
+        return None
+    return f"{(year // 10) * 10}s"
 
 
 def load_canonical_rows(input_csv: str) -> List[dict]:
@@ -77,6 +108,11 @@ def load_canonical_rows(input_csv: str) -> List[dict]:
     Enforces the project invariant here too: a row with no usable tmdb_id is
     skipped (it should never happen in canonical_movies.csv, but we don't
     trust blindly — see the Phase 1 "14 missing rows" incident).
+
+    director/keywords/vote_count/vote_average/decade are read from the CSV
+    only if those columns exist (they don't yet — see Phase 2 enrichment,
+    enrich_rows below, which fills them in-memory for rows that lack them).
+    A CSV without these columns loads exactly as before.
     """
     rows: List[dict] = []
     skipped_no_tmdb_id = 0
@@ -93,6 +129,11 @@ def load_canonical_rows(input_csv: str) -> List[dict]:
             overview = (raw.get("overview") or "").strip()
             score = _to_float(raw.get("score"))
             runtime = _to_int(raw.get("runtime"))
+            director = (raw.get("director") or "").strip() or None
+            keywords = _parse_list(raw.get("keywords"))[:MAX_KEYWORDS]
+            vote_count = _to_int(raw.get("vote_count"))
+            vote_average = _to_float(raw.get("vote_average"))
+            decade = (raw.get("decade") or "").strip() or None
             rows.append(
                 {
                     "tmdb_id": tmdb_id,
@@ -102,6 +143,11 @@ def load_canonical_rows(input_csv: str) -> List[dict]:
                     "overview": overview,
                     "score": score,
                     "runtime": runtime,
+                    "director": director,
+                    "keywords": keywords,
+                    "vote_count": vote_count,
+                    "vote_average": vote_average,
+                    "decade": decade,
                 }
             )
     if skipped_no_tmdb_id:
@@ -114,10 +160,34 @@ def load_canonical_rows(input_csv: str) -> List[dict]:
 
 
 def build_embedding_text(row: dict) -> str:
-    genres_text = ", ".join(row["genres"]) if row["genres"] else "Unknown"
-    year_text = row["year"] if row["year"] is not None else "Unknown year"
+    """Structured, labeled embedding text (Phase 2). Every field falls back to
+    a plain "unknown" placeholder rather than raising or omitting the line
+    entirely — a row missing director/keywords/decade (the common case until
+    a movie has been enriched — see enrich_rows) must still embed cleanly.
+    Deliberately excludes source_country and any availability info; this text
+    is content/taste-only, mirroring the same isolation principle as Phase 1C.
+    """
+    title = row.get("title") or "Unknown title"
+    year = row.get("year")
+    year_text = str(year) if year is not None else "Unknown year"
+    decade = row.get("decade") or _decade_label(year) or "Unknown era"
+    genres_text = ", ".join(row.get("genres") or []) or "Unknown"
+    director = row.get("director") or "Unknown"
+    # Defensively capped again here (belt-and-suspenders on top of the caps
+    # already applied in _fetch_one_enrichment / load_canonical_rows) so this
+    # function alone can never produce runaway embedding text regardless of
+    # what a future caller passes in.
+    keywords = (row.get("keywords") or [])[:MAX_KEYWORDS]
+    keywords_text = ", ".join(keywords) if keywords else "None listed"
+    overview = (row.get("overview") or "").strip() or "No overview available."
     return (
-        f"{row['title']} ({year_text}). Genres: {genres_text}. {row['overview']}"
+        f"Title: {title}\n"
+        f"Year: {year_text}\n"
+        f"Era: {decade}\n"
+        f"Genres: {genres_text}\n"
+        f"Director: {director}\n"
+        f"Keywords/Themes: {keywords_text}\n"
+        f"Overview: {overview}"
     ).strip()
 
 
@@ -152,6 +222,112 @@ def load_existing_tmdb_ids(output_path: str) -> set:
             if doc.get("tmdb_id") is not None:
                 ids.add(doc["tmdb_id"])
     return ids
+
+
+async def _fetch_one_enrichment(tmdb_id: int) -> dict:
+    """Fetch director + keywords + vote stats for one movie, reusing the
+    existing async TMDB client methods (agent/clients/tmdb_client.py) —
+    get_movie, get_movie_keywords, get_movie_credits — the same three methods
+    agent/tools/verify_recommendation.py already calls per-candidate at
+    request time. Never raises: any TMDB failure for a single row degrades to
+    "no enrichment for this row" rather than aborting the whole batch.
+    """
+    from agent.clients.tmdb_client import tmdb_client  # noqa: E402 (needs TMDB_API_KEY)
+
+    try:
+        movie, keywords_payload, credits = await asyncio.gather(
+            tmdb_client.get_movie(tmdb_id),
+            tmdb_client.get_movie_keywords(tmdb_id),
+            tmdb_client.get_movie_credits(tmdb_id),
+        )
+    except Exception as exc:
+        print(f"  WARNING: enrichment failed for tmdb_id={tmdb_id}: {exc}", file=sys.stderr)
+        return {}
+
+    director = None
+    for c in credits.get("crew") or []:
+        if (c.get("job") or "").strip().lower() == "director":
+            director = (c.get("name") or "").strip() or None
+            break
+
+    keywords = [
+        k.get("name") for k in (keywords_payload.get("keywords") or []) if k.get("name")
+    ][:MAX_KEYWORDS]
+
+    return {
+        "director": director,
+        "keywords": keywords,
+        "vote_count": movie.get("vote_count"),
+        "vote_average": movie.get("vote_average"),
+    }
+
+
+def _mock_enrichment(row: dict) -> dict:
+    """Deterministic fixture for --mock-tmdb-enrich, so the enrichment code
+    path (including build_embedding_text's use of the new fields) can be
+    exercised with zero TMDB calls — mirrors --mock-embeddings."""
+    seed = row.get("tmdb_id") or 0
+    return {
+        "director": f"Mock Director {seed % 7}",
+        "keywords": [f"mock-keyword-{seed % 5}", f"mock-keyword-{(seed + 1) % 5}"],
+        "vote_count": 100 + (seed % 5000),
+        "vote_average": round(5.0 + (seed % 50) / 10.0, 1),
+    }
+
+
+async def enrich_rows(
+    rows: List[dict],
+    concurrency: int,
+    enrich: bool,
+    mock: bool,
+) -> List[dict]:
+    """Fill in decade (always, free — derived from year) and, only if
+    requested, director/keywords/vote_count/vote_average via TMDB.
+
+    Additive and idempotent: a row that already carries director/keywords
+    (e.g. loaded from an already-enriched source) is left untouched rather
+    than re-fetched. Without --enrich-tmdb this never touches the network —
+    rows simply keep director=None/keywords=[]/vote_count=None/
+    vote_average=None, which build_embedding_text and rag_search both handle
+    without error.
+    """
+    for row in rows:
+        row.setdefault("decade", _decade_label(row.get("year")))
+
+    if not enrich:
+        for row in rows:
+            row.setdefault("director", None)
+            row.setdefault("keywords", [])
+            row.setdefault("vote_count", None)
+            row.setdefault("vote_average", None)
+        return rows
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _enrich_one(row: dict) -> None:
+        if row.get("director") or row.get("keywords"):
+            return  # already enriched (e.g. present in the source CSV)
+        async with semaphore:
+            try:
+                data = _mock_enrichment(row) if mock else await _fetch_one_enrichment(row["tmdb_id"])
+            except Exception as exc:
+                # Extra safety net: _fetch_one_enrichment already catches TMDB
+                # errors internally and returns {} rather than raising, but
+                # this guarantees that even an unexpected bug here can never
+                # abort asyncio.gather() for the WHOLE batch below — one bad
+                # row must never cost the other ~9k rows their enrichment.
+                print(
+                    f"  WARNING: enrichment crashed for tmdb_id={row.get('tmdb_id')}: {exc}",
+                    file=sys.stderr,
+                )
+                data = {}
+            row["director"] = data.get("director")
+            row["keywords"] = (data.get("keywords") or [])[:MAX_KEYWORDS]
+            row["vote_count"] = data.get("vote_count")
+            row["vote_average"] = data.get("vote_average")
+
+    await asyncio.gather(*(_enrich_one(r) for r in rows))
+    return rows
 
 
 async def embed_rows(
@@ -230,6 +406,11 @@ def upsert_to_pinecone(rows: List[dict], batch_size: int = 100) -> int:
                     "score": row["score"],
                     "overview": row["overview"],
                     "runtime": row["runtime"],
+                    "decade": row.get("decade"),
+                    "director": row.get("director"),
+                    "keywords": row.get("keywords") or [],
+                    "vote_count": row.get("vote_count"),
+                    "vote_average": row.get("vote_average"),
                 },
             }
 
@@ -261,6 +442,16 @@ def main() -> None:
         action="store_true",
         help="Also upsert the built vectors into Pinecone (requires PINECONE_API_KEY)",
     )
+    parser.add_argument(
+        "--enrich-tmdb",
+        action="store_true",
+        help="Fetch director/keywords/vote_count/vote_average per row via TMDB (requires TMDB_API_KEY). Without this flag, those fields are simply left empty.",
+    )
+    parser.add_argument(
+        "--mock-tmdb-enrich",
+        action="store_true",
+        help="With --enrich-tmdb, use deterministic fixture data instead of calling TMDB (zero cost, for pipeline smoke tests)",
+    )
     args = parser.parse_args()
 
     output_path = _resolve_output_path(args.output or config.RAG_DOCUMENTS_PATH)
@@ -283,6 +474,11 @@ def main() -> None:
     if not rows:
         print("Nothing to embed (all rows already indexed, or --limit 0). Done.")
         return
+
+    print(f"Enriching {len(rows)} row(s) (enrich_tmdb={args.enrich_tmdb}, mock={args.mock_tmdb_enrich}) ...")
+    rows = asyncio.run(
+        enrich_rows(rows, concurrency=args.concurrency, enrich=args.enrich_tmdb, mock=args.mock_tmdb_enrich)
+    )
 
     print(f"Embedding {len(rows)} row(s) (mock={args.mock_embeddings}) ...")
     rows = asyncio.run(embed_rows(rows, concurrency=args.concurrency, mock=args.mock_embeddings))

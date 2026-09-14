@@ -50,12 +50,17 @@ Extract exactly these fields:
   votes", "under 1000 ratings", or "obscure/indie" implying a low vote count
 - "out_of_scope": string or null. CineMatch only recommends MOVIES. If the
   request is fundamentally for something else — TV show episodes/seasons,
-  music, books, games — set this to a short, honest reason (e.g. "CineMatch
-  recommends movies, not individual TV episodes."); leave every other field
-  populated as best-effort anyway (e.g. still extract genres/mood so a
-  movie-flavored fallback is possible). A movie/show NAMED as a taste
-  reference (e.g. "something like Breaking Bad") is NOT out of scope — that
-  goes in "similar_to" as normal.
+  music, books, games, or is not a movie-recommendation request at all (e.g.
+  an error message, unrelated text) — set this to a short, honest reason
+  (e.g. "CineMatch recommends movies, not individual TV episodes."). Leave
+  every OTHER field null/empty unless the user's own text also, separately
+  and unambiguously, names a real movie taste preference (e.g. "something
+  like Breaking Bad, but a movie" both flags out_of_scope-adjacent phrasing
+  AND legitimately populates "similar_to") — never invent or infer genres,
+  mood, or themes from an out-of-scope request just to give the fallback
+  something to work with. A movie/show NAMED as a taste reference (e.g.
+  "something like Breaking Bad") is NOT out of scope by itself — that goes in
+  "similar_to" as normal.
 
 If conversation_history is provided, fold in previously stated preferences that
 are not overridden by the current message. Also scan any assistant turns in
@@ -110,6 +115,9 @@ Rules:
 - Note: movie runtime/duration is NOT available from `rag_search`. If the user
   asked for a duration constraint, it can only be honored via
   `tmdb_fallback_search`.
+- If the user explicitly asked for a niche/obscure/lesser-known/indie movie,
+  set `prioritize_niche: true` on `rag_search` so a genuinely lesser-known
+  match isn't deprioritized just for having a low vote_count.
 - If a search returns zero results, adapt: broaden the query or (if allowed)
   use `tmdb_fallback_search`.
 - Make ONE well-chosen `rag_search` call per idea rather than several
